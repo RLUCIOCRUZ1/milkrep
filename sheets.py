@@ -35,6 +35,7 @@ def ler_dados():
 
     aba_clientes = spreadsheet.worksheet("dados_clientes")
     aba_comissao = spreadsheet.worksheet("dados_comissao")
+    aba_vendedores = spreadsheet.worksheet("lista_vendedor")
 
     raw_cli = aba_clientes.get_all_values()
     if not raw_cli:
@@ -51,4 +52,19 @@ def ler_dados():
     else:
         df_comissao = pd.DataFrame()
 
-    return df_clientes, df_comissao, aba_clientes, aba_comissao
+    dados_vendedores = aba_vendedores.get_all_values()
+    if dados_vendedores and dados_vendedores[0]:
+        headers_v = dados_vendedores[0]
+        linhas_v = dados_vendedores[1:]
+        df_vendedores = pd.DataFrame(linhas_v, columns=_headers_unicos(headers_v))
+    else:
+        df_vendedores = pd.DataFrame()
+
+    return (
+        df_clientes,
+        df_comissao,
+        df_vendedores,
+        aba_clientes,
+        aba_comissao,
+        aba_vendedores,
+    )

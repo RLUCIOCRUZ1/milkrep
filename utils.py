@@ -1,5 +1,18 @@
 import pandas as pd
 
+def _tem_valor(v) -> bool:
+    if v is None:
+        return False
+    try:
+        if pd.isna(v):
+            return False
+    except (TypeError, ValueError):
+        pass
+    if isinstance(v, str) and not v.strip():
+        return False
+    return True
+
+
 def traduzir_mes(numero):
     meses = {
         "01": "Janeiro", "02": "Fevereiro", "03": "Março",
@@ -18,15 +31,11 @@ MESES_ABREV_PT = {
 }
 
 
-def tratar_status(valor):
-    if valor is None:
-        return "Sem informação"
-    try:
-        if pd.isna(valor):
-            return "Sem informação"
-    except (TypeError, ValueError):
-        pass
-    if isinstance(valor, str) and not valor.strip():
+def tratar_status(valor, pick_date=None):
+    # Regra de negócio: sem RSN, mas com pick_date preenchido = em separação.
+    if not _tem_valor(valor):
+        if _tem_valor(pick_date):
+            return "em_separação"
         return "Sem informação"
 
     valor = str(valor).upper().strip()

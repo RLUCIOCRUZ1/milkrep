@@ -1,99 +1,375 @@
 import io
+import re
 from datetime import datetime
 
 import pandas as pd
 import streamlit as st
 
-from colunas import (
-    COLUNAS_EXTRAS_PEDIDO,
-    alinhar_colunas_extras,
-    mapear_colunas_clientes,
-)
+from colunas import COLUNAS_EXTRAS_PEDIDO, alinhar_colunas_extras, mapear_colunas_clientes
 from database import (
     carregar_vw_pedido_itens,
-    filtrar_dataframe_pedidos_para_insert,
     limpar_dados_automacao,
     montar_comissao_com_preposto,
+    montar_pedidos_com_preposto,
     salvar_comissao,
     salvar_itens,
     salvar_pedidos,
 )
 from excel_colunas import (
     RENOME_COLUNAS_CANONICAS_SUPABASE,
-    garantir_coluna_sku_por_letra,
     enriquecer_pedidos_colunas_excel,
-    indices_excel_selecionados,
+    garantir_coluna_sku_por_letra,
     indices_excel_somente_pedidos,
-    montar_de_para_planilha_supabase,
 )
-from sheets import ler_dados
+from mailer import enviar_email_com_anexo, validar_config_smtp
+from sheets import ler_dados, ler_lista_email
 from utils import tratar_status
 
+st.set_page_config(page_title="Milkrep", layout="wide")
 
-def _excel_pedidos_e_de_para(df_ped: pd.DataFrame, df_de_para: pd.DataFrame) -> bytes:
+LOGO_PATH = r"C:\Users\Rogerio\.cursor\projects\c-Users-Rogerio-Desktop-Codigos-Milkrep\assets\c__Users_Rogerio_AppData_Roaming_Cursor_User_workspaceStorage_3b02f6d2d3ee055f367070712a9eaa78_images_image-7a0bb355-3f16-42c0-944a-72fbf5005629.png"
+st.logo(LOGO_PATH)
+
+st.markdown(
+    """
+<style>
+    .block-container {
+        padding-top: 1rem;
+        padding-left: 1.5rem;
+        padding-right: 1.5rem;
+    }
+    div[data-testid="stButton"] > button,
+    div[data-testid="stDownloadButton"] > button {
+        border-radius: 14px !important;
+        border: 1px solid #1e4f8d !important;
+        background: linear-gradient(135deg, #0a3f7a 0%, #145ea8 100%) !important;
+        color: #ffffff !important;
+        font-weight: 600 !important;
+        box-shadow: 0 8px 20px rgba(10, 63, 122, 0.25) !important;
+        transition: transform 0.18s ease, box-shadow 0.18s ease, filter 0.18s ease !important;
+    }
+    div[data-testid="stButton"] > button:hover,
+    div[data-testid="stDownloadButton"] > button:hover {
+        transform: translateY(-2px) scale(1.01) !important;
+        box-shadow: 0 12px 24px rgba(10, 63, 122, 0.35) !important;
+        filter: brightness(1.06) !important;
+    }
+    section[data-testid="stSidebar"] {
+        border-right: 1px solid rgba(20, 94, 168, 0.12);
+    }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+COLUNAS_OBRIGATORIAS = ("customer", "store", "customer_name", "order_no", "style", "rsn")
+
+
+def _excel_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df_ped.to_excel(writer, sheet_name="pedidos", index=False)
-        df_de_para.to_excel(writer, sheet_name="de_para", index=False)
+        df.to_excel(writer, sheet_name=sheet_name, index=False)
     buf.seek(0)
     return buf.read()
 
 
-def _excel_view_pedido_itens(df_vw: pd.DataFrame) -> bytes:
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df_vw.to_excel(writer, sheet_name="vw_pedido_itens", index=False)
-    buf.seek(0)
-    return buf.read()
+def _slug(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(s).strip().lower()).strip("_")
 
 
-st.title("Automação")
+def _resolver_coluna(df: pd.DataFrame, aliases: tuple[str, ...]) -> str | None:
+    mapa = {str(c): _slug(c) for c in df.columns}
+    alvo = {_slug(a) for a in aliases}
+    for col, n in mapa.items():
+        if n in alvo:
+            return col
+    return None
 
-COLUNAS_OBRIGATORIAS = [
-    "customer",
-    "store",
-    "customer_name",
-    "order_no",
-    "style",
-    "rsn",
-]
 
-executar = st.button("🚀 Executar Automação")
+def _key_customer(v) -> str | None:
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    s = str(v).strip()
+    if not s:
+        return None
+    s = re.sub(r"\s+", "", s)
+    if re.fullmatch(r"\d+(\.0+)?", s):
+        return str(int(float(s)))
+    return s.upper()
 
-if executar:
+
+def _destinatarios(texto: str) -> list[str]:
+    if not texto:
+        return []
+    parts = re.split(r"[;,]", str(texto))
+    return [p.strip() for p in parts if p.strip() and "@" in p]
+
+
+def _saudacao_horario() -> str:
+    h = datetime.now().hour
+    if h < 12:
+        return "Bom dia"
+    if h < 18:
+        return "Boa tarde"
+    return "Boa noite"
+
+
+def _enviar_carteiras_email() -> None:
+    ok_cfg, msg_cfg = validar_config_smtp()
+    if not ok_cfg:
+        st.error(msg_cfg)
+        st.info(
+            "Para responderem ao e-mail, configure `SMTP_FROM` e `SMTP_REPLY_TO` no .env "
+            "com uma caixa real monitorada."
+        )
+        return
+
+    barra = st.progress(0)
+    status = st.empty()
+
+    def avancar(p: int, m: str) -> None:
+        barra.progress(max(0, min(100, p)))
+        status.caption(f"{p}% - {m}")
+
+    avancar(5, "Lendo lista_email...")
+    df_lista, _ = ler_lista_email()
+    if df_lista.empty:
+        st.error("A aba `lista_email` esta vazia.")
+        return
+
+    col_customer = _resolver_coluna(df_lista, ("customer", "codigo_cliente", "cliente"))
+    col_email = _resolver_coluna(df_lista, ("email", "e_mail", "mail"))
+    if not col_customer or not col_email:
+        st.error("Nao encontrei as colunas `customer` e `email` na aba `lista_email`.")
+        return
+
+    avancar(20, "Carregando vw_pedidos_itens...")
+    df_vw, nome_vw = carregar_vw_pedido_itens()
+    if df_vw.empty:
+        st.error(f"A view `{nome_vw}` esta vazia.")
+        return
+
+    if "customer" not in df_vw.columns:
+        st.error("A view nao possui a coluna `customer` para filtrar os dados.")
+        return
+
+    df_vw = df_vw.copy()
+    df_vw["_key_customer"] = df_vw["customer"].map(_key_customer)
+
+    base_envio = (
+        pd.DataFrame(
+            {
+                "customer": df_lista[col_customer].map(_key_customer),
+                "emails": df_lista[col_email].astype(str).str.strip(),
+            }
+        )
+        .dropna(subset=["customer"])
+        .drop_duplicates(subset=["customer", "emails"], keep="first")
+    )
+    base_envio["destinatarios"] = base_envio["emails"].map(_destinatarios)
+    base_envio = base_envio[base_envio["destinatarios"].map(bool)]
+    if base_envio.empty:
+        st.error("Nenhum destinatario valido encontrado na aba `lista_email`.")
+        return
+
+    hoje = datetime.now().strftime("%d/%m/%Y")
+    assunto = f"Carteira Skechers - {hoje}"
+    corpo = (
+        f"{_saudacao_horario()},\n\n"
+        "Estou te enviando a carteira com as informações do seu pedido Skechers.\n\n"
+        "Qualquer dúvida estamos à disposição."
+    )
+
+    enviados = 0
+    sem_dados = 0
+    erros: list[str] = []
+    total = len(base_envio)
+
+    for i, row in enumerate(base_envio.itertuples(index=False), start=1):
+        customer = row.customer
+        destinatarios = row.destinatarios
+        progresso = 20 + int((i / max(total, 1)) * 75)
+        avancar(progresso, f"Enviando {i}/{total} para customer {customer}...")
+
+        df_cliente = df_vw[df_vw["_key_customer"] == customer].drop(columns=["_key_customer"])
+        if df_cliente.empty:
+            sem_dados += 1
+            continue
+
+        anexo = _excel_bytes(df_cliente, "vw_pedidos_itens")
+        nome_anexo = f"carteira_skechers_{customer}_{datetime.now():%Y%m%d}.xlsx"
+        try:
+            enviar_email_com_anexo(
+                destinatarios=destinatarios,
+                assunto=assunto,
+                corpo_texto=corpo,
+                anexo_bytes=anexo,
+                anexo_nome=nome_anexo,
+            )
+            enviados += 1
+        except Exception as e:
+            erros.append(f"{customer}: {e}")
+
+    avancar(100, "Processo de envio concluido.")
+    st.success(
+        f"Envio finalizado. Enviados: {enviados} | Sem dados: {sem_dados} | Erros: {len(erros)}"
+    )
+    if erros:
+        st.warning("Falhas:\n- " + "\n- ".join(erros[:10]))
+
+
+def _enviar_teste_email(destino: str) -> None:
+    ok_cfg, msg_cfg = validar_config_smtp()
+    if not ok_cfg:
+        st.error(msg_cfg)
+        st.info(
+            "Para Gmail, use SMTP com senha de app (16 caracteres) no `SMTP_PASSWORD`."
+        )
+        return
+
+    destino = (destino or "").strip()
+    if not destino or "@" not in destino:
+        st.error("Informe um e-mail válido para o teste.")
+        return
+
+    barra = st.progress(0)
+    status = st.empty()
+
+    def avancar(p: int, m: str) -> None:
+        barra.progress(max(0, min(100, p)))
+        status.caption(f"{p}% - {m}")
+
+    avancar(10, "Lendo lista_email...")
+    df_lista, _ = ler_lista_email()
+    if df_lista.empty:
+        st.error("A aba `lista_email` esta vazia.")
+        return
+
+    col_customer = _resolver_coluna(df_lista, ("customer", "codigo_cliente", "cliente"))
+    col_email = _resolver_coluna(df_lista, ("email", "e_mail", "mail"))
+    if not col_customer or not col_email:
+        st.error("Nao encontrei as colunas `customer` e `email` na aba `lista_email`.")
+        return
+
+    base_teste = pd.DataFrame(
+        {
+            "customer": df_lista[col_customer].map(_key_customer),
+            "destinatarios": df_lista[col_email].map(_destinatarios),
+        }
+    ).dropna(subset=["customer"])
+    base_teste = base_teste[base_teste["destinatarios"].map(bool)]
+    customers_teste = sorted(
+        {
+            c
+            for c, dests in zip(base_teste["customer"], base_teste["destinatarios"])
+            if destino.lower() in {d.lower() for d in dests}
+        }
+    )
+    if not customers_teste:
+        st.error(
+            "Nao encontrei esse e-mail vinculado a nenhum customer na aba `lista_email`."
+        )
+        return
+
+    avancar(35, "Carregando dados da vw_pedidos_itens...")
+    df_vw, nome_vw = carregar_vw_pedido_itens()
+    if df_vw.empty:
+        st.error(f"A view `{nome_vw}` está vazia para envio de teste.")
+        return
+    if "customer" not in df_vw.columns:
+        st.error("A view nao possui a coluna `customer` para filtrar o teste.")
+        return
+
+    df_vw = df_vw.copy()
+    df_vw["_key_customer"] = df_vw["customer"].map(_key_customer)
+    df_teste = df_vw[df_vw["_key_customer"].isin(customers_teste)].drop(
+        columns=["_key_customer"]
+    )
+    if df_teste.empty:
+        st.error(
+            "Nao encontrei linhas na `vw_pedidos_itens` para os customers do e-mail de teste."
+        )
+        return
+
+    avancar(60, "Gerando anexo Excel filtrado por customer...")
+    anexo = _excel_bytes(df_teste, "vw_pedidos_itens_teste")
+
+    hoje = datetime.now().strftime("%d/%m/%Y")
+    assunto = f"Carteira Skechers - TESTE - {hoje}"
+    clientes_str = ", ".join(customers_teste[:10])
+    if len(customers_teste) > 10:
+        clientes_str += "..."
+    corpo = (
+        f"{_saudacao_horario()},\n\n"
+        "Este é um e-mail de teste da automação Milkrep.\n"
+        "Segue anexo a carteira Skechers filtrada pelos customers vinculados a este e-mail.\n"
+        f"Customers do teste: {clientes_str}\n\n"
+        "Qualquer dúvida estamos à disposição."
+    )
+
+    avancar(85, f"Enviando teste para {destino}...")
+    try:
+        enviar_email_com_anexo(
+            destinatarios=[destino],
+            assunto=assunto,
+            corpo_texto=corpo,
+            anexo_bytes=anexo,
+            anexo_nome=f"carteira_skechers_teste_{datetime.now():%Y%m%d_%H%M}.xlsx",
+        )
+    except Exception as e:
+        st.error(f"Falha no envio de teste: {e}")
+        return
+
+    avancar(100, "Teste concluído.")
+    st.success(
+        f"E-mail de teste enviado com sucesso para {destino} "
+        f"({len(customers_teste)} customer(s), {len(df_teste)} linha(s))."
+    )
+
+
+def _executar_automacao_completa() -> None:
+    barra = st.progress(0)
+    status = st.empty()
+
+    def avancar(percentual: int, msg: str) -> None:
+        barra.progress(max(0, min(100, percentual)))
+        status.caption(f"{percentual}% - {msg}")
+
+    avancar(5, "Iniciando automacao...")
 
     (
         df_clientes,
         df_comissao,
         df_vendedores,
-        aba_clientes,
-        aba_comissao,
-        aba_vendedores,
+        _aba_clientes,
+        _aba_comissao,
+        _aba_vendedores,
     ) = ler_dados()
+    avancar(20, "Planilhas carregadas.")
 
     if df_clientes.empty:
-        st.error("A aba dados_clientes está vazia ou sem linhas de dados.")
-        st.stop()
+        st.error("A aba dados_clientes esta vazia ou sem linhas de dados.")
+        return
 
     headers_orig = list(df_clientes.columns)
-
     df_clientes = mapear_colunas_clientes(df_clientes)
     alinhar_colunas_extras(df_clientes)
     df_clientes = garantir_coluna_sku_por_letra(df_clientes)
+    avancar(35, "Colunas mapeadas e normalizadas.")
 
     faltando = [c for c in COLUNAS_OBRIGATORIAS if c not in df_clientes.columns]
     if faltando:
         st.error(
-            "Não foi possível identificar estas colunas na planilha: "
+            "Nao foi possivel identificar estas colunas na planilha: "
             + ", ".join(faltando)
-            + ". Verifique os cabeçalhos na aba dados_clientes. "
-            + "Colunas lidas: "
-            + ", ".join(str(c) for c in df_clientes.columns)
         )
-        st.stop()
+        return
 
     df_clientes["status_pedido"] = df_clientes["rsn"].apply(tratar_status)
-
     colunas_base = [
         "customer",
         "store",
@@ -105,140 +381,57 @@ if executar:
     ]
     extras = [c for c in COLUNAS_EXTRAS_PEDIDO if c in df_clientes.columns]
     df_pedidos = df_clientes[colunas_base + extras]
-
     df_pedidos = df_pedidos.rename(columns=RENOME_COLUNAS_CANONICAS_SUPABASE)
-
-    indices_pedidos = indices_excel_somente_pedidos()
-    indices_de_para = indices_excel_selecionados()
     df_pedidos = enriquecer_pedidos_colunas_excel(
-        df_clientes, df_pedidos, headers_orig, indices_pedidos
+        df_clientes, df_pedidos, headers_orig, indices_excel_somente_pedidos()
     )
-    df_de_para = montar_de_para_planilha_supabase(
-        headers_orig, df_clientes, indices_de_para
+    df_pedidos["status_pedido"] = df_pedidos.apply(
+        lambda row: tratar_status(row.get("rsn"), row.get("pick_date")),
+        axis=1,
     )
+    df_pedidos = montar_pedidos_com_preposto(df_pedidos, df_vendedores)
+    avancar(55, "Dados de pedidos preparados.")
 
     limpar_dados_automacao()
+    avancar(70, "Tabelas limpas.")
     salvar_pedidos(df_pedidos)
+    avancar(82, "Pedidos gravados.")
     salvar_itens(df_clientes)
+    avancar(90, "Itens gravados.")
+
     df_comissao_final = montar_comissao_com_preposto(df_comissao, df_vendedores)
     tabela_comissao, qtd_comissao = salvar_comissao(df_comissao_final)
+    avancar(100, "Comissionamento atualizado.")
 
-    extras_ausentes = [c for c in COLUNAS_EXTRAS_PEDIDO if c not in df_pedidos.columns]
-    st.session_state["preview_conferencia"] = filtrar_dataframe_pedidos_para_insert(
-        df_pedidos
-    ).copy()
-    st.session_state["preview_de_para"] = df_de_para.copy()
-    st.session_state["extras_pedido_ausentes"] = extras_ausentes
-    st.session_state["conferencia_xlsx_nome"] = (
-        f"milkrep_conferencia_{datetime.now():%Y%m%d_%H%M}.xlsx"
-    )
-    st.session_state["preview_comissao"] = df_comissao_final.copy()
-    st.session_state["comissao_tabela_usada"] = tabela_comissao
-    st.session_state["comissao_qtd"] = qtd_comissao
-    try:
-        df_vw, nome_vw = carregar_vw_pedido_itens()
-        st.session_state["preview_vw_pedido_itens"] = df_vw.copy()
-        st.session_state["nome_vw_pedido_itens"] = nome_vw
-        st.session_state.pop("erro_vw_pedido_itens", None)
-    except Exception as e:
-        st.session_state["erro_vw_pedido_itens"] = str(e)
-
-    msg_comissao = (
-        f" | comissão: {qtd_comissao} linhas em `{tabela_comissao}`"
-        if tabela_comissao
-        else " | comissão: sem linhas para carregar"
-    )
-    st.success(f"✅ Dados enviados com sucesso!{msg_comissao}")
-
-if st.button("🔄 Atualizar tabela da view pedido_itens"):
-    try:
-        df_vw, nome_vw = carregar_vw_pedido_itens()
-        st.session_state["preview_vw_pedido_itens"] = df_vw.copy()
-        st.session_state["nome_vw_pedido_itens"] = nome_vw
-        st.session_state.pop("erro_vw_pedido_itens", None)
-        st.success(f"View `{nome_vw}` atualizada.")
-    except Exception as e:
-        st.session_state["erro_vw_pedido_itens"] = str(e)
-        st.error(f"Não foi possível carregar a view: {e}")
-
-if "preview_conferencia" in st.session_state:
-    st.divider()
-    st.subheader("De-para: planilha → Supabase")
-    st.caption(
-        "Colunas **D, E, O, Q, V, Y, Z, AS, AD, AF** → `pedidos`. "
-        "Coluna **L** → `itens_pedido.sku`. Faixa **AV–CC** → só `itens_pedido` (quantidades); "
-        "aparecem aqui só no de-para, não no insert de `pedidos`."
-    )
-    dp = st.session_state.get("preview_de_para")
-    if dp is not None and not dp.empty:
-        st.dataframe(dp, use_container_width=True, height=400)
-
-    st.subheader("Conferência — payload gravado em `pedidos`")
-    st.caption(
-        "Igual ao insert em `pedidos`: só colunas listadas em `database.py` "
-        "(`COLUNAS_INSERT_PEDIDOS` + opcionais em `COLUNAS_PEDIDO_EXTRAS_NO_SUPABASE`). "
-        "Sem colunas AU–CC. Células vazias → `NULL`."
-    )
-    df_c = st.session_state["preview_conferencia"]
-    aus = st.session_state.get("extras_pedido_ausentes") or []
-    if aus:
-        lista = ", ".join(f"`{x}`" for x in aus)
-        st.info(
-            "Extras definidos em `COLUNAS_EXTRAS_PEDIDO` que **não apareceram** após o mapeamento: "
-            f"{lista}."
-        )
-    st.dataframe(df_c, use_container_width=True, height=520)
-
-    nome_xlsx = st.session_state.get(
-        "conferencia_xlsx_nome", "milkrep_conferencia.xlsx"
-    )
-    dp_df = st.session_state.get("preview_de_para")
-    if dp_df is not None and not dp_df.empty:
-        data_xlsx = _excel_pedidos_e_de_para(df_c, dp_df)
-    else:
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as w:
-            df_c.to_excel(w, sheet_name="pedidos", index=False)
-        buf.seek(0)
-        data_xlsx = buf.read()
-    st.download_button(
-        label="Exportar pedidos + de-para para Excel (.xlsx)",
-        data=data_xlsx,
-        file_name=nome_xlsx,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="download_excel_conferencia",
+    st.success(
+        "Automacao concluida com sucesso. "
+        f"Comissao: {qtd_comissao} linhas em `{tabela_comissao}`."
     )
 
-if "preview_comissao" in st.session_state:
-    st.divider()
-    tabela = st.session_state.get("comissao_tabela_usada", "comissao")
-    qtd = st.session_state.get("comissao_qtd", 0)
-    st.subheader(f"Conferência — comissão carregada em `{tabela}`")
-    st.caption(
-        f"Total de linhas enviadas: {qtd}. "
-        "Inclui coluna `preposto` via lookup por código do cliente (Grupo x CUSTOMER)."
-    )
-    st.dataframe(st.session_state["preview_comissao"], use_container_width=True, height=360)
 
-if "preview_vw_pedido_itens" in st.session_state:
-    st.divider()
-    nome_vw = st.session_state.get("nome_vw_pedido_itens", "vw_pedido_itens")
-    st.subheader(f"Cópia completa da view `{nome_vw}`")
-    df_vw = st.session_state["preview_vw_pedido_itens"]
-    st.caption(
-        f"Dados extraídos do banco unindo pedidos + itens_pedido. "
-        f"Total de linhas carregadas: {len(df_vw)}."
-    )
-    st.dataframe(df_vw, use_container_width=True, height=520)
-    st.download_button(
-        label="Exportar view para Excel (.xlsx)",
-        data=_excel_view_pedido_itens(df_vw),
-        file_name=f"{nome_vw}_{datetime.now():%Y%m%d_%H%M}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="download_excel_view_pedido_itens",
-    )
-elif "erro_vw_pedido_itens" in st.session_state:
-    st.warning(
-        "A tabela da view ainda não está disponível na tela: "
-        + st.session_state["erro_vw_pedido_itens"]
-    )
+st.title("Milkrep")
+st.caption("Central de automacao e navegacao do projeto.")
+
+if st.button("🚀 Rodar automacao completa (Pedidos + Comissao)", use_container_width=True):
+    _executar_automacao_completa()
+
+if st.button("📧 Enviar carteira por e-mail (lista_email)", use_container_width=True):
+    _enviar_carteiras_email()
+
+st.subheader("Teste de E-mail")
+email_teste = st.text_input(
+    "E-mail para teste",
+    value="rluciocruz@gmail.com",
+    help="Este envio é somente de teste, sem usar a lista de clientes.",
+)
+if st.button("🧪 Enviar teste para meu e-mail", use_container_width=True):
+    _enviar_teste_email(email_teste)
+
+st.subheader("Navegação")
+c1, c2 = st.columns(2)
+with c1:
+    if st.button("📦 Ir para Pedidos", use_container_width=True):
+        st.switch_page("pages/1_Pedidos.py")
+with c2:
+    if st.button("💰 Ir para Comissionamento", use_container_width=True):
+        st.switch_page("pages/2_Comissionamento.py")

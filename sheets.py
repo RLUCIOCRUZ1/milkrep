@@ -68,3 +68,15 @@ def ler_dados():
         aba_comissao,
         aba_vendedores,
     )
+
+
+def ler_lista_email():
+    client = conectar()
+    spreadsheet = client.open_by_key("1faq_Zxtm8Qs7nenLDCLdQmpsqj-34wVvmCLywcFe55I")
+    aba = spreadsheet.worksheet("lista_email")
+    dados = aba.get_all_values()
+    if dados and dados[0]:
+        headers = _headers_unicos(dados[0])
+        linhas = dados[1:]
+        return pd.DataFrame(linhas, columns=headers), aba
+    return pd.DataFrame(), aba

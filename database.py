@@ -23,6 +23,9 @@ COLUNAS_PEDIDO_EXTRAS_NO_SUPABASE: tuple[str, ...] = (
     "pick_date",
     "data_original",
     "data_faturamento",
+    "nome_fantasia",
+    "cnpj",
+    "preposto",
     # "payment_type_condicao_de_pagamento",
 )
 
@@ -67,9 +70,24 @@ def _carregar_tabela_completa(nome_tabela: str, page_size: int = 1000) -> list[d
 def carregar_vw_pedido_itens() -> tuple[pd.DataFrame, str]:
     """
     Lê a view de consolidação pedidos+itens no Supabase.
-    Tenta os dois nomes comuns para evitar quebra por variação de nomenclatura.
+    Usa o nome oficial `vw_pedidos_itens`.
     """
-    candidatas = ("vw_pedido_itens", "vw_pedidos_itens")
+    nome = "vw_pedidos_itens"
+    try:
+        dados = _carregar_tabela_completa(nome)
+        return pd.DataFrame(dados), nome
+    except Exception as e:
+        raise Exception(
+            f"Não foi possível carregar `{nome}`. Confirme se a view existe no schema public e se a role da API tem permissão de SELECT. Erro original: {e}"
+        ) from e
+
+
+def carregar_vw_pedidos() -> tuple[pd.DataFrame, str]:
+    """
+    Lê a view de pedidos no Supabase.
+    Se `vw_pedidos` não existir, faz fallback para a tabela `pedidos`.
+    """
+    candidatas = ("vw_pedidos", "pedidos")
     ultimo_erro = None
     for nome in candidatas:
         try:
@@ -77,9 +95,30 @@ def carregar_vw_pedido_itens() -> tuple[pd.DataFrame, str]:
             return pd.DataFrame(dados), nome
         except Exception as e:
             ultimo_erro = e
-    if ultimo_erro:
-        raise ultimo_erro
-    return pd.DataFrame(), candidatas[0]
+            continue
+    raise Exception(
+        "Não foi possível carregar `vw_pedidos` nem fallback `pedidos`. "
+        f"Confirme existência/permissão de SELECT. Erro original: {ultimo_erro}"
+    ) from ultimo_erro
+
+
+def carregar_comissionamento() -> tuple[pd.DataFrame, str]:
+    """
+    Carrega tabela de comissionamento para visualização.
+    """
+    candidatas = ("comissao_complete", "comissao")
+    ultimo_erro = None
+    for nome in candidatas:
+        try:
+            dados = _carregar_tabela_completa(nome)
+            return pd.DataFrame(dados), nome
+        except Exception as e:
+            ultimo_erro = e
+            continue
+    raise Exception(
+        "Não foi possível carregar comissionamento (`comissao_complete`/`comissao`). "
+        f"Erro original: {ultimo_erro}"
+    ) from ultimo_erro
 
 
 def _normalizar_colunas_unicas(colunas: list[str]) -> list[str]:
@@ -107,6 +146,29 @@ def _normalizar_colunas_unicas(colunas: list[str]) -> list[str]:
 
 def _serie_texto_limpa(s: pd.Series) -> pd.Series:
     return s.astype(str).str.strip().replace({"": None, "nan": None, "None": None})
+
+
+def _serie_chave_lookup(s: pd.Series) -> pd.Series:
+    """Normaliza chave textual para lookup (trim, sem espaços, uppercase, numérico canônico)."""
+    base = _serie_texto_limpa(s).str.replace(r"\s+", "", regex=True)
+    # Evita divergência de formato entre '3', '03' e '3.0'.
+    mask_num = base.str.fullmatch(r"\d+(\.0+)?", na=False)
+    base.loc[mask_num] = base.loc[mask_num].map(lambda x: str(int(float(x))))
+    return base.str.upper()
+
+
+def _resolver_coluna_por_alias(
+    df: pd.DataFrame, aliases: tuple[str, ...], fallback_idx: int | None = None
+) -> str | None:
+    """Encontra coluna por nome (normalizado) e, se não achar, usa índice fixo."""
+    mapa = {str(c): normalizar_header(str(c)) for c in df.columns}
+    alvos = {normalizar_header(a) for a in aliases}
+    for col, norm in mapa.items():
+        if norm in alvos:
+            return col
+    if fallback_idx is not None and 0 <= fallback_idx < len(df.columns):
+        return str(df.columns[fallback_idx])
+    return None
 
 
 def montar_comissao_com_preposto(
@@ -156,6 +218,168 @@ def montar_comissao_com_preposto(
     return dfc
 
 
+def montar_pedidos_com_preposto(
+    df_pedidos: pd.DataFrame, df_vendedores: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Aplica PROCV para pedidos:
+    1) prioridade por chave customer_store (customer + store),
+    2) fallback só por customer quando pedido não tiver store.
+    """
+    if df_pedidos.empty:
+        return pd.DataFrame()
+
+    dfp = df_pedidos.copy()
+    if "customer" not in dfp.columns:
+        dfp["nome_fantasia"] = None
+        dfp["cnpj"] = None
+        dfp["preposto"] = None
+        return dfp
+
+    if df_vendedores.empty:
+        dfp["nome_fantasia"] = None
+        dfp["cnpj"] = None
+        dfp["preposto"] = None
+        return dfp
+
+    # Mantém a mesma regra da comissão:
+    # coluna B (index 1) = CUSTOMER, coluna J (index 9) = PREPOSTOS.
+    if len(df_vendedores.columns) < 10:
+        dfp["nome_fantasia"] = None
+        dfp["cnpj"] = None
+        dfp["preposto"] = None
+        return dfp
+
+    col_customer = str(df_vendedores.columns[1])
+    col_prepostos = str(df_vendedores.columns[9])
+    col_customer_store = _resolver_coluna_por_alias(
+        df_vendedores,
+        aliases=("customer_store", "customerstore", "customer_loja"),
+    )
+    col_store_vendedor = _resolver_coluna_por_alias(
+        df_vendedores,
+        aliases=("store", "loja", "cod_loja", "codigo_loja"),
+        fallback_idx=2,
+    )
+    col_nome_fantasia = _resolver_coluna_por_alias(
+        df_vendedores,
+        aliases=("nome_fantasia", "fantasia", "nomefantasia"),
+        fallback_idx=2,
+    )
+    col_cnpj = _resolver_coluna_por_alias(
+        df_vendedores,
+        aliases=("cnpj", "cnpj_cpf", "cpf_cnpj"),
+        fallback_idx=3,
+    )
+
+    customer_vendedor = _serie_chave_lookup(df_vendedores[col_customer])
+    if col_store_vendedor is not None:
+        store_vendedor = _serie_chave_lookup(df_vendedores[col_store_vendedor])
+        customer_store_vendedor = None
+        mask_cs = customer_vendedor.notna() & store_vendedor.notna()
+        customer_store_vendedor = pd.Series([None] * len(df_vendedores), index=df_vendedores.index)
+        customer_store_vendedor.loc[mask_cs] = (
+            customer_vendedor.loc[mask_cs] + "_" + store_vendedor.loc[mask_cs]
+        )
+    elif col_customer_store is not None:
+        customer_store_vendedor = _serie_chave_lookup(df_vendedores[col_customer_store])
+    else:
+        customer_store_vendedor = pd.Series([None] * len(df_vendedores), index=df_vendedores.index)
+
+    chave_vendedor = pd.DataFrame(
+        {
+            "customer": customer_vendedor,
+            "customer_store": customer_store_vendedor,
+            "nome_fantasia": (
+                _serie_texto_limpa(df_vendedores[col_nome_fantasia])
+                if col_nome_fantasia is not None
+                else None
+            ),
+            "cnpj": (
+                _serie_texto_limpa(df_vendedores[col_cnpj])
+                if col_cnpj is not None
+                else None
+            ),
+            "preposto": (
+                _serie_texto_limpa(df_vendedores[col_prepostos])
+                if col_prepostos is not None
+                else None
+            ),
+        }
+    ).dropna(subset=["customer"])
+
+    for col in ("nome_fantasia", "cnpj", "preposto"):
+        if col in dfp.columns:
+            dfp.drop(columns=[col], inplace=True)
+
+    dfp["_lookup_customer"] = _serie_chave_lookup(dfp["customer"])
+    if "store" in dfp.columns:
+        store_key = _serie_chave_lookup(dfp["store"])
+        dfp["_lookup_customer_store"] = None
+        m = dfp["_lookup_customer"].notna() & store_key.notna()
+        dfp.loc[m, "_lookup_customer_store"] = (
+            dfp.loc[m, "_lookup_customer"] + "_" + store_key.loc[m]
+        )
+        fallback_por_customer = store_key.isna()
+    else:
+        dfp["_lookup_customer_store"] = None
+        fallback_por_customer = pd.Series([True] * len(dfp), index=dfp.index)
+
+    cols_retorno = ["nome_fantasia", "cnpj", "preposto"]
+
+    if "customer_store" in chave_vendedor.columns:
+        mapa_customer_store = (
+            chave_vendedor.dropna(subset=["customer_store"])
+            .drop_duplicates(subset=["customer_store"], keep="first")
+            [["customer_store"] + cols_retorno]
+            .rename(columns={c: f"{c}_cs" for c in cols_retorno})
+        )
+        dfp = dfp.merge(
+            mapa_customer_store,
+            left_on="_lookup_customer_store",
+            right_on="customer_store",
+            how="left",
+        )
+    else:
+        for c in cols_retorno:
+            dfp[f"{c}_cs"] = None
+
+    mapa_customer = (
+        chave_vendedor.drop_duplicates(subset=["customer"], keep="first")
+        [["customer"] + cols_retorno]
+        .rename(
+            columns={
+                "customer": "_lookup_customer",
+                **{c: f"{c}_c" for c in cols_retorno},
+            }
+        )
+    )
+    dfp = dfp.merge(mapa_customer, on="_lookup_customer", how="left")
+
+    for c in cols_retorno:
+        dfp[c] = dfp[f"{c}_cs"]
+        # Regra de negócio: fallback por customer só quando store estiver vazio.
+        dfp.loc[fallback_por_customer, c] = (
+            dfp.loc[fallback_por_customer, c]
+            .where(dfp.loc[fallback_por_customer, c].notna(), dfp.loc[fallback_por_customer, f"{c}_c"])
+        )
+
+    colunas_temp = [
+        "_lookup_customer",
+        "_lookup_customer_store",
+        "customer_store",
+    ] + [f"{c}_cs" for c in cols_retorno] + [f"{c}_c" for c in cols_retorno]
+    dfp.drop(columns=[c for c in colunas_temp if c in dfp.columns], inplace=True)
+
+    # Mantém ordem solicitada: nome_fantasia/cnpj antes de customer_name.
+    if "customer_name" in dfp.columns:
+        cols = [c for c in dfp.columns if c not in {"nome_fantasia", "cnpj"}]
+        idx = cols.index("customer_name")
+        cols[idx:idx] = [c for c in ("nome_fantasia", "cnpj") if c in dfp.columns]
+        dfp = dfp[cols]
+    return dfp
+
+
 def _limpar_tabela_generica(nome_tabela: str) -> None:
     """
     Limpa tabela com tentativas de filtros compatíveis com PostgREST.
@@ -185,7 +409,7 @@ def salvar_comissao(df_comissao_final: pd.DataFrame) -> tuple[str, int]:
         return "", 0
 
     dados = [
-        {k: _valor_para_api(v) for k, v in row.items()}
+        {k: _valor_para_api_comissao(k, v) for k, v in row.items()}
         for row in df_comissao_final.to_dict(orient="records")
     ]
     if not dados:
@@ -231,6 +455,30 @@ def _valor_para_api(v):
         except Exception:
             pass
     return v
+
+
+def _normalizar_doc_comissao(v):
+    """Normaliza coluna `doc` sem pontuação decimal/milhar."""
+    bruto = _valor_para_api(v)
+    if bruto is None:
+        return None
+    n = _parse_numero_flexivel(bruto)
+    if n is not None:
+        # Ex.: 370.380,00 -> 370380
+        if float(n).is_integer():
+            return str(int(n))
+    s = str(bruto).strip()
+    if not s:
+        return None
+    s = s.replace(".", "").replace(",", "")
+    s = re.sub(r"\s+", "", s)
+    return s or None
+
+
+def _valor_para_api_comissao(coluna: str, v):
+    if coluna == "doc":
+        return _normalizar_doc_comissao(v)
+    return _valor_para_api(v)
 
 
 def _itens_suporta_contexto() -> bool:

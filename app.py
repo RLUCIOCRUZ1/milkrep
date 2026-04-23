@@ -47,7 +47,6 @@ if not _logo_source:
             break
 if _logo_source:
     st.logo(_logo_source)
-    st.sidebar.image(_logo_source, use_container_width=True)
 
 st.markdown(
     """

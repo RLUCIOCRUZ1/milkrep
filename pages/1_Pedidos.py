@@ -26,7 +26,6 @@ if not _logo_source:
             break
 if _logo_source:
     st.logo(_logo_source)
-    st.sidebar.image(_logo_source, use_container_width=True)
 st.markdown(
     """
 <style>
@@ -317,6 +316,21 @@ elif "pedidos_vw_df" in st.session_state:
     if not modo_rapido:
         _dashboards(df_filtrado)
 
+    st.subheader("Exportacao")
+    if st.button("📥 Gerar arquivo Excel filtrado", use_container_width=False):
+        st.session_state["pedidos_excel_bytes"] = _excel_bytes(df_filtrado, "vw_pedidos_itens")
+        st.session_state["pedidos_excel_nome"] = f"vw_pedidos_itens_{datetime.now():%Y%m%d_%H%M}.xlsx"
+    if st.session_state.get("pedidos_excel_bytes"):
+        st.download_button(
+            label="⬇️ Baixar Excel filtrado (.xlsx)",
+            data=st.session_state["pedidos_excel_bytes"],
+            file_name=st.session_state.get("pedidos_excel_nome", "vw_pedidos_itens.xlsx"),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_vw_pedidos_itens",
+        )
+    else:
+        st.caption("Clique em `Gerar arquivo Excel filtrado` para habilitar o download.")
+
     st.subheader("Tabela Dados completo")
     exibir_tabela = st.checkbox(
         "Exibir tabela detalhada",
@@ -331,10 +345,3 @@ elif "pedidos_vw_df" in st.session_state:
             help="Exibir menos linhas deixa a pagina muito mais rapida.",
         )
         st.dataframe(df_filtrado.head(linhas_exibir), use_container_width=True, height=520)
-    st.download_button(
-        label="Exportar dados filtrados para Excel (.xlsx)",
-        data=_excel_bytes(df_filtrado, "vw_pedidos_itens"),
-        file_name=f"vw_pedidos_itens_{datetime.now():%Y%m%d_%H%M}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="download_vw_pedidos_itens",
-    )

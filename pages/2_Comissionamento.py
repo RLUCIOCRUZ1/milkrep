@@ -1,6 +1,8 @@
 import io
+import os
 import re
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -8,8 +10,15 @@ import streamlit as st
 from database import carregar_comissionamento
 
 st.set_page_config(page_title="Comissionamento", layout="wide")
-LOGO_PATH = r"C:\Users\Rogerio\.cursor\projects\c-Users-Rogerio-Desktop-Codigos-Milkrep\assets\c__Users_Rogerio_AppData_Roaming_Cursor_User_workspaceStorage_3b02f6d2d3ee055f367070712a9eaa78_images_image-7a0bb355-3f16-42c0-944a-72fbf5005629.png"
-st.logo(LOGO_PATH)
+_logo_candidates = [
+    os.getenv("APP_LOGO_PATH", "").strip(),
+    str(Path(__file__).resolve().parents[1] / "logo.png"),
+    str(Path(__file__).resolve().parents[1] / "assets" / "logo.png"),
+]
+for _logo_path in _logo_candidates:
+    if _logo_path and Path(_logo_path).is_file():
+        st.logo(_logo_path)
+        break
 st.markdown(
     """
 <style>

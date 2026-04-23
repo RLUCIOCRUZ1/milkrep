@@ -1,3 +1,6 @@
+import json
+import os
+
 import gspread
 import pandas as pd
 from google.oauth2.service_account import Credentials
@@ -19,10 +22,15 @@ def _headers_unicos(headers):
 
 
 def conectar():
-    creds = Credentials.from_service_account_file(
-        "credenciais.json",
-        scopes=SCOPES
-    )
+    creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
+    if creds_json:
+        creds_info = json.loads(creds_json)
+        creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+    else:
+        creds = Credentials.from_service_account_file(
+            "credenciais.json",
+            scopes=SCOPES
+        )
     client = gspread.authorize(creds)
     return client
 

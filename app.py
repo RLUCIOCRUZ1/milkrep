@@ -55,7 +55,7 @@ if not _logo_source:
             _logo_source = _logo_path
             break
 if _logo_source:
-    st.sidebar.image(_logo_source, width=220)
+    st.logo(_logo_source, size="large")
 
 st.markdown(
     """

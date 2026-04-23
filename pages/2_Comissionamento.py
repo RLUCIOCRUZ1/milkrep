@@ -10,8 +10,10 @@ import streamlit as st
 from database import carregar_comissionamento
 
 st.set_page_config(page_title="Comissionamento", layout="wide")
+_logo_env_path = os.getenv("APP_LOGO_PATH", "").strip().replace("\\", "/")
 _logo_candidates = [
-    os.getenv("APP_LOGO_PATH", "").strip(),
+    _logo_env_path,
+    str(Path(__file__).resolve().parents[1] / _logo_env_path) if _logo_env_path else "",
     str(Path(__file__).resolve().parents[1] / "logo.png"),
     str(Path(__file__).resolve().parents[1] / "assets" / "logo.png"),
 ]
@@ -134,7 +136,18 @@ if erro:
 else:
     df = _normalizar_doc_exibicao(df)
     st.caption(f"Fonte dos dados: `{nome_origem}` | Total de linhas: {len(df)}")
-    st.dataframe(df, use_container_width=True, height=520)
+    exibir_tabela = st.checkbox(
+        "Exibir tabela detalhada",
+        value=False,
+        help="Desative para acelerar a pagina quando não precisar visualizar linhas.",
+    )
+    if exibir_tabela:
+        linhas_exibir = st.selectbox(
+            "Linhas para exibir na tabela",
+            options=[200, 500, 1000, 2000, 5000],
+            index=1,
+        )
+        st.dataframe(df.head(linhas_exibir), use_container_width=True, height=520)
     st.download_button(
         label="Exportar comissionamento para Excel (.xlsx)",
         data=_excel_bytes(df, nome_origem or "comissionamento"),

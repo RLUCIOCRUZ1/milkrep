@@ -31,8 +31,10 @@ st.set_page_config(page_title="Milkyrep", layout="wide")
 
 # Em produção (Render/Linux), caminhos absolutos do Windows quebram.
 # Tenta usar um caminho configurado por variável de ambiente ou arquivos locais conhecidos.
+_logo_env_path = os.getenv("APP_LOGO_PATH", "").strip().replace("\\", "/")
 _logo_candidates = [
-    os.getenv("APP_LOGO_PATH", "").strip(),
+    _logo_env_path,
+    str(Path(__file__).resolve().parent / _logo_env_path) if _logo_env_path else "",
     str(Path(__file__).with_name("logo.png")),
     str(Path(__file__).with_name("assets") / "logo.png"),
 ]

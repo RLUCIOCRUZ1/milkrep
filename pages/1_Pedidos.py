@@ -10,8 +10,10 @@ import streamlit as st
 from database import carregar_vw_pedido_itens
 
 st.set_page_config(page_title="Pedidos", layout="wide")
+_logo_env_path = os.getenv("APP_LOGO_PATH", "").strip().replace("\\", "/")
 _logo_candidates = [
-    os.getenv("APP_LOGO_PATH", "").strip(),
+    _logo_env_path,
+    str(Path(__file__).resolve().parents[1] / _logo_env_path) if _logo_env_path else "",
     str(Path(__file__).resolve().parents[1] / "logo.png"),
     str(Path(__file__).resolve().parents[1] / "assets" / "logo.png"),
 ]
@@ -316,13 +318,19 @@ elif "pedidos_vw_df" in st.session_state:
         _dashboards(df_filtrado)
 
     st.subheader("Tabela Dados completo")
-    linhas_exibir = st.selectbox(
-        "Linhas para exibir na tabela",
-        options=[200, 500, 1000, 2000, 5000],
-        index=1,
-        help="Exibir menos linhas deixa a pagina muito mais rapida.",
+    exibir_tabela = st.checkbox(
+        "Exibir tabela detalhada",
+        value=False,
+        help="Desative para acelerar a navegacao quando não precisar visualizar linhas.",
     )
-    st.dataframe(df_filtrado.head(linhas_exibir), use_container_width=True, height=520)
+    if exibir_tabela:
+        linhas_exibir = st.selectbox(
+            "Linhas para exibir na tabela",
+            options=[200, 500, 1000, 2000, 5000],
+            index=1,
+            help="Exibir menos linhas deixa a pagina muito mais rapida.",
+        )
+        st.dataframe(df_filtrado.head(linhas_exibir), use_container_width=True, height=520)
     st.download_button(
         label="Exportar dados filtrados para Excel (.xlsx)",
         data=_excel_bytes(df_filtrado, "vw_pedidos_itens"),

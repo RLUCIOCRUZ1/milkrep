@@ -25,7 +25,7 @@ from mailer import enviar_email_com_anexo, validar_config_smtp
 from sheets import ler_dados, ler_lista_email
 from utils import tratar_status
 
-st.set_page_config(page_title="Milkrep", layout="wide")
+st.set_page_config(page_title="Milkyrep", layout="wide")
 
 LOGO_PATH = r"C:\Users\Rogerio\.cursor\projects\c-Users-Rogerio-Desktop-Codigos-Milkrep\assets\c__Users_Rogerio_AppData_Roaming_Cursor_User_workspaceStorage_3b02f6d2d3ee055f367070712a9eaa78_images_image-7a0bb355-3f16-42c0-944a-72fbf5005629.png"
 st.logo(LOGO_PATH)
@@ -62,6 +62,12 @@ st.markdown(
     unsafe_allow_html=True,
 )
 COLUNAS_OBRIGATORIAS = ("customer", "store", "customer_name", "order_no", "style", "rsn")
+ASSINATURA_EMAIL = (
+    "Atenciosamente,\n\n"
+    "Maísa Gomes\n"
+    "MILKY REPRESENTAÇÕES COMERCIAIS LTDA\n"
+    "(62) 3271-1026 / whatsapp 99275-3077"
+)
 
 
 def _excel_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
@@ -116,6 +122,29 @@ def _saudacao_horario() -> str:
     if h < 18:
         return "Boa tarde"
     return "Boa noite"
+
+
+def _referencia_cliente(df: pd.DataFrame, customer_chave: str) -> str:
+    for coluna_nome in ("nome_fantasia", "customer_name"):
+        if coluna_nome not in df.columns:
+            continue
+        nomes_validos = df[coluna_nome].dropna().map(lambda v: str(v).strip())
+        nomes_validos = nomes_validos[
+            nomes_validos.map(lambda v: bool(v) and v.lower() not in {"nan", "none"})
+        ]
+        if not nomes_validos.empty:
+            return nomes_validos.iloc[0]
+    return f"Customer {customer_chave}"
+
+
+def _montar_corpo_email(referencia_cliente: str) -> str:
+    return (
+        f"{_saudacao_horario()},\n\n"
+        "Segue em anexo sua carteira Skechers.\n"
+        f"Cliente: {referencia_cliente}.\n\n"
+        "Qualquer dúvida, estamos à disposição.\n\n"
+        f"{ASSINATURA_EMAIL}"
+    )
 
 
 def _enviar_carteiras_email() -> None:
@@ -178,12 +207,6 @@ def _enviar_carteiras_email() -> None:
 
     hoje = datetime.now().strftime("%d/%m/%Y")
     assunto = f"Carteira Skechers - {hoje}"
-    corpo = (
-        f"{_saudacao_horario()},\n\n"
-        "Estou te enviando a carteira com as informações do seu pedido Skechers.\n\n"
-        "Qualquer dúvida estamos à disposição."
-    )
-
     enviados = 0
     sem_dados = 0
     erros: list[str] = []
@@ -202,6 +225,8 @@ def _enviar_carteiras_email() -> None:
 
         anexo = _excel_bytes(df_cliente, "vw_pedidos_itens")
         nome_anexo = f"carteira_skechers_{customer}_{datetime.now():%Y%m%d}.xlsx"
+        referencia_cliente = _referencia_cliente(df_cliente, customer)
+        corpo = _montar_corpo_email(referencia_cliente)
         try:
             enviar_email_com_anexo(
                 destinatarios=destinatarios,
@@ -222,18 +247,15 @@ def _enviar_carteiras_email() -> None:
         st.warning("Falhas:\n- " + "\n- ".join(erros[:10]))
 
 
-def _enviar_teste_email(destino: str) -> None:
+def _enviar_carteira_por_customer(customer_informado: str) -> None:
     ok_cfg, msg_cfg = validar_config_smtp()
     if not ok_cfg:
         st.error(msg_cfg)
-        st.info(
-            "Para Gmail, use SMTP com senha de app (16 caracteres) no `SMTP_PASSWORD`."
-        )
         return
 
-    destino = (destino or "").strip()
-    if not destino or "@" not in destino:
-        st.error("Informe um e-mail válido para o teste.")
+    customer_chave = _key_customer(customer_informado)
+    if not customer_chave:
+        st.error("Informe um customer valido para envio.")
         return
 
     barra = st.progress(0)
@@ -255,79 +277,72 @@ def _enviar_teste_email(destino: str) -> None:
         st.error("Nao encontrei as colunas `customer` e `email` na aba `lista_email`.")
         return
 
-    base_teste = pd.DataFrame(
+    base_envio = pd.DataFrame(
         {
             "customer": df_lista[col_customer].map(_key_customer),
             "destinatarios": df_lista[col_email].map(_destinatarios),
         }
     ).dropna(subset=["customer"])
-    base_teste = base_teste[base_teste["destinatarios"].map(bool)]
-    customers_teste = sorted(
-        {
-            c
-            for c, dests in zip(base_teste["customer"], base_teste["destinatarios"])
-            if destino.lower() in {d.lower() for d in dests}
-        }
-    )
-    if not customers_teste:
+    base_envio = base_envio[base_envio["destinatarios"].map(bool)]
+    base_customer = base_envio[base_envio["customer"] == customer_chave]
+    if base_customer.empty:
         st.error(
-            "Nao encontrei esse e-mail vinculado a nenhum customer na aba `lista_email`."
+            f"Nao encontrei destinatarios para o customer `{customer_chave}` na aba `lista_email`."
+        )
+        return
+
+    destinatarios = sorted(
+        {d for lista in base_customer["destinatarios"] for d in lista if d.strip()}
+    )
+    if not destinatarios:
+        st.error(
+            f"O customer `{customer_chave}` foi encontrado, mas sem e-mails validos para envio."
         )
         return
 
     avancar(35, "Carregando dados da vw_pedidos_itens...")
     df_vw, nome_vw = carregar_vw_pedido_itens()
     if df_vw.empty:
-        st.error(f"A view `{nome_vw}` está vazia para envio de teste.")
+        st.error(f"A view `{nome_vw}` esta vazia para envio.")
         return
     if "customer" not in df_vw.columns:
-        st.error("A view nao possui a coluna `customer` para filtrar o teste.")
+        st.error("A view nao possui a coluna `customer` para filtrar o envio.")
         return
 
     df_vw = df_vw.copy()
     df_vw["_key_customer"] = df_vw["customer"].map(_key_customer)
-    df_teste = df_vw[df_vw["_key_customer"].isin(customers_teste)].drop(
-        columns=["_key_customer"]
-    )
-    if df_teste.empty:
+    df_customer = df_vw[df_vw["_key_customer"] == customer_chave].drop(columns=["_key_customer"])
+    if df_customer.empty:
         st.error(
-            "Nao encontrei linhas na `vw_pedidos_itens` para os customers do e-mail de teste."
+            f"Nao encontrei linhas na `vw_pedidos_itens` para o customer `{customer_chave}`."
         )
         return
 
     avancar(60, "Gerando anexo Excel filtrado por customer...")
-    anexo = _excel_bytes(df_teste, "vw_pedidos_itens_teste")
+    anexo = _excel_bytes(df_customer, "vw_pedidos_itens")
 
     hoje = datetime.now().strftime("%d/%m/%Y")
-    assunto = f"Carteira Skechers - TESTE - {hoje}"
-    clientes_str = ", ".join(customers_teste[:10])
-    if len(customers_teste) > 10:
-        clientes_str += "..."
-    corpo = (
-        f"{_saudacao_horario()},\n\n"
-        "Este é um e-mail de teste da automação Milkrep.\n"
-        "Segue anexo a carteira Skechers filtrada pelos customers vinculados a este e-mail.\n"
-        f"Customers do teste: {clientes_str}\n\n"
-        "Qualquer dúvida estamos à disposição."
-    )
+    assunto = f"Carteira Skechers - {hoje}"
+    referencia_cliente = _referencia_cliente(df_customer, customer_chave)
+    corpo = _montar_corpo_email(referencia_cliente)
 
-    avancar(85, f"Enviando teste para {destino}...")
+    avancar(85, f"Enviando carteira para customer {customer_chave}...")
     try:
         enviar_email_com_anexo(
-            destinatarios=[destino],
+            destinatarios=destinatarios,
             assunto=assunto,
             corpo_texto=corpo,
             anexo_bytes=anexo,
-            anexo_nome=f"carteira_skechers_teste_{datetime.now():%Y%m%d_%H%M}.xlsx",
+            anexo_nome=f"carteira_skechers_{customer_chave}_{datetime.now():%Y%m%d_%H%M}.xlsx",
         )
     except Exception as e:
-        st.error(f"Falha no envio de teste: {e}")
+        st.error(f"Falha no envio da carteira para customer `{customer_chave}`: {e}")
         return
 
-    avancar(100, "Teste concluído.")
+    avancar(100, "Envio concluido.")
     st.success(
-        f"E-mail de teste enviado com sucesso para {destino} "
-        f"({len(customers_teste)} customer(s), {len(df_teste)} linha(s))."
+        f"Carteira enviada com sucesso para o customer `{customer_chave}` "
+        f"({len(destinatarios)} destinatario(s), {len(df_customer)} linha(s))."
     )
 
 
@@ -409,7 +424,7 @@ def _executar_automacao_completa() -> None:
     )
 
 
-st.title("Milkrep")
+st.title("Milkyrep")
 st.caption("Central de automacao e navegacao do projeto.")
 
 if st.button("🚀 Rodar automacao completa (Pedidos + Comissao)", use_container_width=True):
@@ -418,14 +433,14 @@ if st.button("🚀 Rodar automacao completa (Pedidos + Comissao)", use_container
 if st.button("📧 Enviar carteira por e-mail (lista_email)", use_container_width=True):
     _enviar_carteiras_email()
 
-st.subheader("Teste de E-mail")
-email_teste = st.text_input(
-    "E-mail para teste",
-    value="rluciocruz@gmail.com",
-    help="Este envio é somente de teste, sem usar a lista de clientes.",
+st.subheader("Envio por Customer")
+customer_envio = st.text_input(
+    "Customer para envio",
+    value="",
+    help="Informe o customer. O sistema busca os e-mails na aba `lista_email`, filtra os dados e envia a carteira.",
 )
-if st.button("🧪 Enviar teste para meu e-mail", use_container_width=True):
-    _enviar_teste_email(email_teste)
+if st.button("🧪 Enviar carteira por customer", use_container_width=True):
+    _enviar_carteira_por_customer(customer_envio)
 
 st.subheader("Navegação")
 c1, c2 = st.columns(2)

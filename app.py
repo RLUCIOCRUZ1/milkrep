@@ -1,6 +1,8 @@
 import io
+import logging
 import os
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -28,6 +30,13 @@ from sheets import ler_dados, ler_lista_email
 from utils import tratar_status
 
 st.set_page_config(page_title="Milkyrep", layout="wide")
+
+logger = logging.getLogger("milkyrep.app")
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
 
 # Em produção (Render/Linux), caminhos absolutos do Windows quebram.
 # Tenta usar um caminho configurado por variável de ambiente ou arquivos locais conhecidos.
@@ -166,8 +175,11 @@ def _montar_corpo_email(referencia_cliente: str) -> str:
 
 
 def _enviar_carteiras_email() -> None:
+    inicio_exec = time.perf_counter()
+    logger.info("Iniciando envio em lote de carteiras por e-mail.")
     ok_cfg, msg_cfg = validar_config_smtp()
     if not ok_cfg:
+        logger.error("Config SMTP inválida para envio em lote: %s", msg_cfg)
         st.error(msg_cfg)
         st.info(
             "Para responderem ao e-mail, configure `SMTP_FROM` e `SMTP_REPLY_TO` no .env "
@@ -185,22 +197,26 @@ def _enviar_carteiras_email() -> None:
     avancar(5, "Lendo lista_email...")
     df_lista, _ = ler_lista_email()
     if df_lista.empty:
+        logger.warning("Envio em lote abortado: aba lista_email vazia.")
         st.error("A aba `lista_email` esta vazia.")
         return
 
     col_customer = _resolver_coluna(df_lista, ("customer", "codigo_cliente", "cliente"))
     col_email = _resolver_coluna(df_lista, ("email", "e_mail", "mail"))
     if not col_customer or not col_email:
+        logger.error("Envio em lote abortado: colunas customer/email não encontradas em lista_email.")
         st.error("Nao encontrei as colunas `customer` e `email` na aba `lista_email`.")
         return
 
     avancar(20, "Carregando vw_pedidos_itens...")
     df_vw, nome_vw = carregar_vw_pedido_itens()
     if df_vw.empty:
+        logger.warning("Envio em lote abortado: view %s vazia.", nome_vw)
         st.error(f"A view `{nome_vw}` esta vazia.")
         return
 
     if "customer" not in df_vw.columns:
+        logger.error("Envio em lote abortado: coluna customer ausente na view.")
         st.error("A view nao possui a coluna `customer` para filtrar os dados.")
         return
 
@@ -220,8 +236,10 @@ def _enviar_carteiras_email() -> None:
     base_envio["destinatarios"] = base_envio["emails"].map(_destinatarios)
     base_envio = base_envio[base_envio["destinatarios"].map(bool)]
     if base_envio.empty:
+        logger.warning("Envio em lote abortado: nenhum destinatário válido na lista_email.")
         st.error("Nenhum destinatario valido encontrado na aba `lista_email`.")
         return
+    logger.info("Envio em lote iniciado com %s customers elegíveis.", len(base_envio))
 
     hoje = datetime.now().strftime("%d/%m/%Y")
     assunto = f"Carteira Skechers - {hoje}"
@@ -233,12 +251,14 @@ def _enviar_carteiras_email() -> None:
     for i, row in enumerate(base_envio.itertuples(index=False), start=1):
         customer = row.customer
         destinatarios = row.destinatarios
+        ini_customer = time.perf_counter()
         progresso = 20 + int((i / max(total, 1)) * 75)
         avancar(progresso, f"Enviando {i}/{total} para customer {customer}...")
 
         df_cliente = df_vw[df_vw["_key_customer"] == customer].drop(columns=["_key_customer"])
         if df_cliente.empty:
             sem_dados += 1
+            logger.info("Customer %s sem dados na view. Pulando.", customer)
             continue
 
         anexo = _excel_bytes(df_cliente, "vw_pedidos_itens")
@@ -246,6 +266,12 @@ def _enviar_carteiras_email() -> None:
         referencia_cliente = _referencia_cliente(df_cliente, customer)
         corpo = _montar_corpo_email(referencia_cliente)
         try:
+            logger.info(
+                "Enviando customer %s para %s destinatários (%s linhas).",
+                customer,
+                len(destinatarios),
+                len(df_cliente),
+            )
             enviar_email_com_anexo(
                 destinatarios=destinatarios,
                 assunto=assunto,
@@ -254,7 +280,13 @@ def _enviar_carteiras_email() -> None:
                 anexo_nome=nome_anexo,
             )
             enviados += 1
+            logger.info(
+                "Envio customer %s concluído em %.2fs.",
+                customer,
+                time.perf_counter() - ini_customer,
+            )
         except Exception as e:
+            logger.exception("Falha no envio para customer %s: %s", customer, e)
             erros.append(f"{customer}: {e}")
 
     avancar(100, "Processo de envio concluido.")
@@ -263,16 +295,27 @@ def _enviar_carteiras_email() -> None:
     )
     if erros:
         st.warning("Falhas:\n- " + "\n- ".join(erros[:10]))
+    logger.info(
+        "Envio em lote finalizado em %.2fs | enviados=%s | sem_dados=%s | erros=%s",
+        time.perf_counter() - inicio_exec,
+        enviados,
+        sem_dados,
+        len(erros),
+    )
 
 
 def _enviar_carteira_por_customer(customer_informado: str) -> None:
+    inicio_exec = time.perf_counter()
+    logger.info("Iniciando envio por customer: entrada=%s", customer_informado)
     ok_cfg, msg_cfg = validar_config_smtp()
     if not ok_cfg:
+        logger.error("Config SMTP inválida para envio por customer: %s", msg_cfg)
         st.error(msg_cfg)
         return
 
     customer_chave = _key_customer(customer_informado)
     if not customer_chave:
+        logger.warning("Envio por customer abortado: customer inválido.")
         st.error("Informe um customer valido para envio.")
         return
 
@@ -286,12 +329,14 @@ def _enviar_carteira_por_customer(customer_informado: str) -> None:
     avancar(10, "Lendo lista_email...")
     df_lista, _ = ler_lista_email()
     if df_lista.empty:
+        logger.warning("Envio por customer abortado: lista_email vazia.")
         st.error("A aba `lista_email` esta vazia.")
         return
 
     col_customer = _resolver_coluna(df_lista, ("customer", "codigo_cliente", "cliente"))
     col_email = _resolver_coluna(df_lista, ("email", "e_mail", "mail"))
     if not col_customer or not col_email:
+        logger.error("Envio por customer abortado: colunas customer/email ausentes.")
         st.error("Nao encontrei as colunas `customer` e `email` na aba `lista_email`.")
         return
 
@@ -304,6 +349,7 @@ def _enviar_carteira_por_customer(customer_informado: str) -> None:
     base_envio = base_envio[base_envio["destinatarios"].map(bool)]
     base_customer = base_envio[base_envio["customer"] == customer_chave]
     if base_customer.empty:
+        logger.warning("Envio por customer abortado: customer %s sem destinatários na lista_email.", customer_chave)
         st.error(
             f"Nao encontrei destinatarios para o customer `{customer_chave}` na aba `lista_email`."
         )
@@ -313,6 +359,7 @@ def _enviar_carteira_por_customer(customer_informado: str) -> None:
         {d for lista in base_customer["destinatarios"] for d in lista if d.strip()}
     )
     if not destinatarios:
+        logger.warning("Envio por customer abortado: customer %s sem e-mails válidos.", customer_chave)
         st.error(
             f"O customer `{customer_chave}` foi encontrado, mas sem e-mails validos para envio."
         )
@@ -321,9 +368,11 @@ def _enviar_carteira_por_customer(customer_informado: str) -> None:
     avancar(35, "Carregando dados da vw_pedidos_itens...")
     df_vw, nome_vw = carregar_vw_pedido_itens()
     if df_vw.empty:
+        logger.warning("Envio por customer abortado: view %s vazia.", nome_vw)
         st.error(f"A view `{nome_vw}` esta vazia para envio.")
         return
     if "customer" not in df_vw.columns:
+        logger.error("Envio por customer abortado: coluna customer ausente na view.")
         st.error("A view nao possui a coluna `customer` para filtrar o envio.")
         return
 
@@ -331,6 +380,7 @@ def _enviar_carteira_por_customer(customer_informado: str) -> None:
     df_vw["_key_customer"] = df_vw["customer"].map(_key_customer)
     df_customer = df_vw[df_vw["_key_customer"] == customer_chave].drop(columns=["_key_customer"])
     if df_customer.empty:
+        logger.warning("Envio por customer abortado: customer %s sem linhas na view.", customer_chave)
         st.error(
             f"Nao encontrei linhas na `vw_pedidos_itens` para o customer `{customer_chave}`."
         )
@@ -346,6 +396,12 @@ def _enviar_carteira_por_customer(customer_informado: str) -> None:
 
     avancar(85, f"Enviando carteira para customer {customer_chave}...")
     try:
+        logger.info(
+            "Enviando customer %s para %s destinatários (%s linhas).",
+            customer_chave,
+            len(destinatarios),
+            len(df_customer),
+        )
         enviar_email_com_anexo(
             destinatarios=destinatarios,
             assunto=assunto,
@@ -354,6 +410,7 @@ def _enviar_carteira_por_customer(customer_informado: str) -> None:
             anexo_nome=f"carteira_skechers_{customer_chave}_{datetime.now():%Y%m%d_%H%M}.xlsx",
         )
     except Exception as e:
+        logger.exception("Falha no envio por customer %s: %s", customer_chave, e)
         st.error(f"Falha no envio da carteira para customer `{customer_chave}`: {e}")
         return
 
@@ -361,6 +418,11 @@ def _enviar_carteira_por_customer(customer_informado: str) -> None:
     st.success(
         f"Carteira enviada com sucesso para o customer `{customer_chave}` "
         f"({len(destinatarios)} destinatario(s), {len(df_customer)} linha(s))."
+    )
+    logger.info(
+        "Envio por customer finalizado em %.2fs para %s.",
+        time.perf_counter() - inicio_exec,
+        customer_chave,
     )
 
 

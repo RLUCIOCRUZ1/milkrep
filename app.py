@@ -55,7 +55,7 @@ if not _logo_source:
             _logo_source = _logo_path
             break
 if _logo_source:
-    st.logo(_logo_source, size="large")
+    st.sidebar.image(_logo_source, width=220)
 
 st.markdown(
     """
@@ -84,11 +84,8 @@ st.markdown(
     section[data-testid="stSidebar"] {
         border-right: 1px solid rgba(20, 94, 168, 0.12);
     }
-    section[data-testid="stSidebar"] [data-testid="stLogo"] img,
-    section[data-testid="stSidebar"] .stLogo img {
-        max-height: 72px !important;
-        height: 72px !important;
-        width: auto !important;
+    section[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] img {
+        margin-bottom: 12px;
     }
 </style>
 """,

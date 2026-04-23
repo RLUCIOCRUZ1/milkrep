@@ -37,13 +37,15 @@ _logo_candidates = [
     str(Path(__file__).with_name("assets") / "logo.png"),
 ]
 _logo_url = os.getenv("APP_LOGO_URL", "").strip()
-if _logo_url:
-    st.logo(_logo_url)
-else:
+_logo_source = _logo_url
+if not _logo_source:
     for _logo_path in _logo_candidates:
         if _logo_path and Path(_logo_path).is_file():
-            st.logo(_logo_path)
+            _logo_source = _logo_path
             break
+if _logo_source:
+    st.logo(_logo_source)
+    st.sidebar.image(_logo_source, use_container_width=True)
 
 st.markdown(
     """

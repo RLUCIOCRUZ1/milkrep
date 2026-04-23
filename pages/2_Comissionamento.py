@@ -16,13 +16,15 @@ _logo_candidates = [
     str(Path(__file__).resolve().parents[1] / "assets" / "logo.png"),
 ]
 _logo_url = os.getenv("APP_LOGO_URL", "").strip()
-if _logo_url:
-    st.logo(_logo_url)
-else:
+_logo_source = _logo_url
+if not _logo_source:
     for _logo_path in _logo_candidates:
         if _logo_path and Path(_logo_path).is_file():
-            st.logo(_logo_path)
+            _logo_source = _logo_path
             break
+if _logo_source:
+    st.logo(_logo_source)
+    st.sidebar.image(_logo_source, use_container_width=True)
 st.markdown(
     """
 <style>
@@ -54,9 +56,19 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
+@st.cache_data(ttl=300, show_spinner=False)
+def _carregar_cache() -> tuple[pd.DataFrame, str]:
+    df, nome = carregar_comissionamento()
+    return df, nome
+
+
+def _atualizar_cache_comissionamento() -> None:
+    _carregar_cache.clear()
+
+
 def _carregar() -> tuple[pd.DataFrame, str, str | None]:
     try:
-        df, nome = carregar_comissionamento()
+        df, nome = _carregar_cache()
         return df, nome, None
     except Exception as e:
         return pd.DataFrame(), "", str(e)
@@ -113,6 +125,8 @@ def _normalizar_doc_exibicao(df: pd.DataFrame) -> pd.DataFrame:
 
 st.title("Comissionamento")
 st.caption("A automacao roda na pagina inicial `app`.")
+if st.button("🔄 Atualizar dados", use_container_width=False):
+    _atualizar_cache_comissionamento()
 
 df, nome_origem, erro = _carregar()
 if erro:

@@ -16,13 +16,15 @@ _logo_candidates = [
     str(Path(__file__).resolve().parents[1] / "assets" / "logo.png"),
 ]
 _logo_url = os.getenv("APP_LOGO_URL", "").strip()
-if _logo_url:
-    st.logo(_logo_url)
-else:
+_logo_source = _logo_url
+if not _logo_source:
     for _logo_path in _logo_candidates:
         if _logo_path and Path(_logo_path).is_file():
-            st.logo(_logo_path)
+            _logo_source = _logo_path
             break
+if _logo_source:
+    st.logo(_logo_source)
+    st.sidebar.image(_logo_source, use_container_width=True)
 st.markdown(
     """
 <style>
@@ -100,9 +102,16 @@ def _format_brl(valor: float) -> str:
     return f"R$ {txt}"
 
 
-def _carregar_view() -> None:
+@st.cache_data(ttl=300, show_spinner=False)
+def _carregar_view_cache() -> tuple[pd.DataFrame, str]:
+    return carregar_vw_pedido_itens()
+
+
+def _carregar_view(force: bool = False) -> None:
+    if force:
+        _carregar_view_cache.clear()
     try:
-        df_vw, nome_vw = carregar_vw_pedido_itens()
+        df_vw, nome_vw = _carregar_view_cache()
         st.session_state["pedidos_vw_df"] = df_vw.copy()
         st.session_state["pedidos_vw_nome"] = nome_vw
         st.session_state.pop("pedidos_vw_erro", None)
@@ -283,7 +292,10 @@ def _dashboards(df: pd.DataFrame) -> None:
 st.title("Pedidos")
 st.caption("A automacao roda na pagina inicial `app`.")
 
-_carregar_view()
+if st.button("🔄 Atualizar dados", use_container_width=False):
+    _carregar_view(force=True)
+else:
+    _carregar_view()
 
 if "pedidos_vw_erro" in st.session_state:
     st.error(f"Nao foi possivel carregar a view: {st.session_state['pedidos_vw_erro']}")

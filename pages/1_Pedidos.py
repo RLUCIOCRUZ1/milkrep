@@ -131,7 +131,8 @@ def _aplicar_filtros(df: pd.DataFrame) -> pd.DataFrame:
             return []
         return sorted(df[col].dropna().astype(str).str.strip().replace("", pd.NA).dropna().unique().tolist())
 
-    df_filtrado = df.copy()
+    # Evita cópia completa da base em cada rerun (ganho de performance em bases grandes).
+    df_filtrado = df
     if "data_faturamento" in df_filtrado.columns:
         dt = pd.to_datetime(df_filtrado["data_faturamento"], errors="coerce", dayfirst=True)
         anos_disp = sorted(dt.dt.year.dropna().astype(int).unique().tolist())
@@ -306,12 +307,24 @@ elif "pedidos_vw_df" in st.session_state:
 
     df_filtrado = _aplicar_filtros(df_vw)
     st.caption(f"Linhas apos filtros: {len(df_filtrado)}")
-    _dashboards(df_filtrado)
+    modo_rapido = st.toggle(
+        "⚡ Modo rapido (recomendado no Render Free)",
+        value=True,
+        help="Quando ativo, pula os dashboards pesados e acelera abertura da pagina.",
+    )
+    if not modo_rapido:
+        _dashboards(df_filtrado)
 
     st.subheader("Tabela Dados completo")
-    st.dataframe(df_filtrado, use_container_width=True, height=520)
+    linhas_exibir = st.selectbox(
+        "Linhas para exibir na tabela",
+        options=[200, 500, 1000, 2000, 5000],
+        index=1,
+        help="Exibir menos linhas deixa a pagina muito mais rapida.",
+    )
+    st.dataframe(df_filtrado.head(linhas_exibir), use_container_width=True, height=520)
     st.download_button(
-        label="Exportar dados para Excel (.xlsx)",
+        label="Exportar dados filtrados para Excel (.xlsx)",
         data=_excel_bytes(df_filtrado, "vw_pedidos_itens"),
         file_name=f"vw_pedidos_itens_{datetime.now():%Y%m%d_%H%M}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

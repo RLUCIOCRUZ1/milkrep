@@ -36,10 +36,14 @@ _logo_candidates = [
     str(Path(__file__).with_name("logo.png")),
     str(Path(__file__).with_name("assets") / "logo.png"),
 ]
-for _logo_path in _logo_candidates:
-    if _logo_path and Path(_logo_path).is_file():
-        st.logo(_logo_path)
-        break
+_logo_url = os.getenv("APP_LOGO_URL", "").strip()
+if _logo_url:
+    st.logo(_logo_url)
+else:
+    for _logo_path in _logo_candidates:
+        if _logo_path and Path(_logo_path).is_file():
+            st.logo(_logo_path)
+            break
 
 st.markdown(
     """

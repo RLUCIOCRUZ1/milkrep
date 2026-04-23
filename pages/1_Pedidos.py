@@ -25,7 +25,7 @@ if not _logo_source:
             _logo_source = _logo_path
             break
 if _logo_source:
-    st.logo(_logo_source)
+    st.logo(_logo_source, size="large")
 st.markdown(
     """
 <style>
@@ -95,6 +95,25 @@ def _to_float_series(serie: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce")
 
 
+def _to_datetime_faturamento(serie: pd.Series) -> pd.Series:
+    """
+    Faz parsing robusto sem warnings de dayfirst:
+    - ISO (YYYY-MM-DD): parse direto sem dayfirst
+    - demais formatos: parse com dayfirst=True
+    """
+    s = serie.astype(str).str.strip()
+    dt = pd.to_datetime(
+        s.where(s.str.match(r"^\d{4}-\d{2}-\d{2}$", na=False)),
+        errors="coerce",
+    )
+    faltantes = dt.isna()
+    if faltantes.any():
+        dt.loc[faltantes] = pd.to_datetime(
+            s.loc[faltantes], errors="coerce", dayfirst=True
+        )
+    return dt
+
+
 def _format_brl(valor: float) -> str:
     if pd.isna(valor):
         return "R$ 0,00"
@@ -135,14 +154,14 @@ def _aplicar_filtros(df: pd.DataFrame) -> pd.DataFrame:
     # Evita cópia completa da base em cada rerun (ganho de performance em bases grandes).
     df_filtrado = df
     if "data_faturamento" in df_filtrado.columns:
-        dt = pd.to_datetime(df_filtrado["data_faturamento"], errors="coerce", dayfirst=True)
+        dt = _to_datetime_faturamento(df_filtrado["data_faturamento"])
         anos_disp = sorted(dt.dt.year.dropna().astype(int).unique().tolist())
         f_anos = c0.multiselect("Ano", anos_disp)
         meses_disp = list(range(1, 13))
         f_meses = c00.multiselect("Mês", meses_disp)
         if f_anos:
             df_filtrado = df_filtrado[dt.dt.year.isin(f_anos)]
-            dt = pd.to_datetime(df_filtrado["data_faturamento"], errors="coerce", dayfirst=True)
+            dt = _to_datetime_faturamento(df_filtrado["data_faturamento"])
         if f_meses:
             df_filtrado = df_filtrado[dt.dt.month.isin(f_meses)]
 
@@ -204,7 +223,7 @@ def _dashboards(df: pd.DataFrame) -> None:
 
     st.subheader("Tabela / Dashboard Mês/Ano - Faturamento")
     if "data_faturamento" in base.columns:
-        base["data_faturamento_dt"] = pd.to_datetime(base["data_faturamento"], errors="coerce", dayfirst=True)
+        base["data_faturamento_dt"] = _to_datetime_faturamento(base["data_faturamento"])
         d1 = (
             base.dropna(subset=["data_faturamento_dt"])
             .assign(mes_ano=lambda x: x["data_faturamento_dt"].dt.strftime("%m/%Y"))
@@ -214,9 +233,7 @@ def _dashboards(df: pd.DataFrame) -> None:
         if not d1.empty:
             d1_qtd = (
                 df_qtd.assign(
-                    data_faturamento_dt=pd.to_datetime(
-                        df_qtd["data_faturamento"], errors="coerce", dayfirst=True
-                    )
+                    data_faturamento_dt=_to_datetime_faturamento(df_qtd["data_faturamento"])
                 )
                 .dropna(subset=["data_faturamento_dt"])
                 .assign(mes_ano=lambda x: x["data_faturamento_dt"].dt.strftime("%m/%Y"))

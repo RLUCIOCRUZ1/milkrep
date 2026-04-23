@@ -46,7 +46,7 @@ if not _logo_source:
             _logo_source = _logo_path
             break
 if _logo_source:
-    st.logo(_logo_source)
+    st.logo(_logo_source, size="large")
 
 st.markdown(
     """

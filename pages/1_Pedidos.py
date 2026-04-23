@@ -169,7 +169,7 @@ def _aplicar_filtros(df: pd.DataFrame) -> pd.DataFrame:
     f_nome = c2.multiselect("Nome Fantasia", opcoes("nome_fantasia"))
     f_preposto = c3.multiselect("Preposto", opcoes("preposto"))
     f_desc = c4.multiselect("Descrição Modelo", opcoes("descricao_modelo"))
-    pedido_pk_txt = c5.text_input("Pedido PK (separado por vírgula)")
+    pedido_pk_txt = c5.text_input("Pedido_pk")
 
     if f_cnpj and "cnpj" in df_filtrado.columns:
         df_filtrado = df_filtrado[df_filtrado["cnpj"].astype(str).isin(f_cnpj)]

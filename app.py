@@ -3,11 +3,13 @@ import logging
 import os
 import re
 import time
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from openpyxl.styles import Font
 
 from colunas import COLUNAS_EXTRAS_PEDIDO, alinhar_colunas_extras, mapear_colunas_clientes
 from database import (
@@ -100,10 +102,203 @@ ASSINATURA_EMAIL = (
 )
 
 
+def _to_float_series(serie: pd.Series) -> pd.Series:
+    s = serie.astype(str).str.strip()
+    s = s.replace({"": None, "None": None, "nan": None})
+    s = s.str.replace(r"[^\d,.\-]", "", regex=True)
+    mask_both = s.str.contains(",", na=False) & s.str.contains(r"\.", na=False)
+    s.loc[mask_both] = (
+        s.loc[mask_both]
+        .str.replace(".", "", regex=False)
+        .str.replace(",", ".", regex=False)
+    )
+    mask_comma = s.str.contains(",", na=False) & ~s.str.contains(r"\.", na=False)
+    s.loc[mask_comma] = s.loc[mask_comma].str.replace(",", ".", regex=False)
+    return pd.to_numeric(s, errors="coerce").fillna(0)
+
+
+def _format_brl(valor: float) -> str:
+    txt = f"{float(valor):,.2f}"
+    txt = txt.replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"R$ {txt}"
+
+
+def _format_pecas(valor: float) -> str:
+    v = float(valor)
+    if abs(v - round(v)) < 1e-9:
+        return f"{int(round(v))} peças"
+    txt = f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"{txt} peças"
+
+
+def _normalizar_texto(valor: str) -> str:
+    txt = unicodedata.normalize("NFKD", str(valor))
+    txt = "".join(ch for ch in txt if not unicodedata.combining(ch))
+    return txt.lower().strip()
+
+
+def _status_para_resumo(status_original: str) -> tuple[str, int, int]:
+    meses = {
+        "janeiro": 1,
+        "jan": 1,
+        "fevereiro": 2,
+        "fev": 2,
+        "marco": 3,
+        "mar": 3,
+        "abril": 4,
+        "abr": 4,
+        "maio": 5,
+        "mai": 5,
+        "junho": 6,
+        "jun": 6,
+        "julho": 7,
+        "jul": 7,
+        "agosto": 8,
+        "ago": 8,
+        "setembro": 9,
+        "set": 9,
+        "outubro": 10,
+        "out": 10,
+        "novembro": 11,
+        "nov": 11,
+        "dezembro": 12,
+        "dez": 12,
+    }
+    nomes_meses = {
+        1: "Janeiro",
+        2: "Fevereiro",
+        3: "Março",
+        4: "Abril",
+        5: "Maio",
+        6: "Junho",
+        7: "Julho",
+        8: "Agosto",
+        9: "Setembro",
+        10: "Outubro",
+        11: "Novembro",
+        12: "Dezembro",
+    }
+    texto = str(status_original or "").strip()
+    txt_norm = _normalizar_texto(texto)
+    if txt_norm.startswith("liberacao"):
+        mes_ordem = 99
+        for token in txt_norm.split():
+            if token in meses:
+                mes_ordem = meses[token]
+        if mes_ordem != 99:
+            return f"Liberação {nomes_meses[mes_ordem]}", 0, mes_ordem
+        return "Liberação (Sem mês)", 0, 99
+    return texto or "Sem informação", 1, 999
+
+
+def _montar_resumo_excel(df: pd.DataFrame) -> pd.DataFrame:
+    base = df.copy()
+    col_status = _resolver_coluna(base, ("status_pedido", "status"))
+    col_modelo = _resolver_coluna(base, ("descricao_modelo",))
+    col_qtd = _resolver_coluna(base, ("quantidade", "qtd", "quantity"))
+    col_valor = _resolver_coluna(base, ("valor", "total", "valor_total"))
+
+    if col_status is None and "rsn" in base.columns:
+        base["status_pedido"] = base.apply(
+            lambda row: tratar_status(row.get("rsn"), row.get("pick_date")), axis=1
+        )
+        col_status = "status_pedido"
+    if col_status is None:
+        base["status_pedido"] = "Sem informação"
+        col_status = "status_pedido"
+
+    if col_modelo is None:
+        base["descricao_modelo"] = "Sem informação"
+        col_modelo = "descricao_modelo"
+
+    if col_qtd:
+        base["__qtd_num"] = _to_float_series(base[col_qtd])
+    else:
+        base["__qtd_num"] = 0
+
+    if col_valor:
+        base["__valor_num"] = _to_float_series(base[col_valor])
+    else:
+        base["__valor_num"] = 0
+
+    status_meta = base[col_status].map(_status_para_resumo)
+    base["status_resumo"] = status_meta.map(lambda x: x[0])
+    base["grupo_tipo"] = status_meta.map(lambda x: x[1])
+    base["ordem_mes"] = status_meta.map(lambda x: x[2])
+
+    status_ordenado = (
+        base.groupby("status_resumo", dropna=False, as_index=False)[
+            ["__qtd_num", "__valor_num", "grupo_tipo", "ordem_mes"]
+        ]
+        .agg(
+            {
+                "__qtd_num": "sum",
+                "__valor_num": "sum",
+                "grupo_tipo": "min",
+                "ordem_mes": "min",
+            }
+        )
+        .rename(columns={"__qtd_num": "quantidade", "__valor_num": "valor"})
+        .sort_values(["grupo_tipo", "ordem_mes", "status_resumo"], ascending=True)
+    )
+
+    detalhes_modelo = (
+        base.groupby(["status_resumo", col_modelo], dropna=False, as_index=False)[
+            ["__qtd_num", "__valor_num"]
+        ]
+        .sum()
+        .rename(
+            columns={
+                col_modelo: "descricao_modelo",
+                "__qtd_num": "quantidade",
+                "__valor_num": "valor",
+            }
+        )
+        .sort_values(["status_resumo", "valor", "quantidade"], ascending=[True, False, False])
+    )
+
+    linhas_resumo: list[dict[str, str]] = []
+    for _, row_status in status_ordenado.iterrows():
+        status_nome = row_status["status_resumo"]
+        linhas_resumo.append(
+            {
+                "status_pedido": status_nome,
+                "quantidade": _format_pecas(row_status["quantidade"]),
+                "valor": _format_brl(row_status["valor"]),
+            }
+        )
+        detalhes_status = detalhes_modelo[detalhes_modelo["status_resumo"] == status_nome]
+        for row_modelo in detalhes_status.itertuples(index=False):
+            nome_modelo = str(row_modelo.descricao_modelo).strip() or "Sem informação"
+            linhas_resumo.append(
+                {
+                    "status_pedido": f"    {nome_modelo}",
+                    "quantidade": _format_pecas(row_modelo.quantidade),
+                    "valor": _format_brl(row_modelo.valor),
+                }
+            )
+        linhas_resumo.append({"status_pedido": "", "quantidade": "", "valor": ""})
+
+    if linhas_resumo and not linhas_resumo[-1]["status_pedido"]:
+        linhas_resumo.pop()
+
+    return pd.DataFrame(linhas_resumo, columns=["status_pedido", "quantidade", "valor"])
+
+
 def _excel_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
+    resumo_df = _montar_resumo_excel(df)
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name=sheet_name, index=False)
+        resumo_df.to_excel(writer, sheet_name="resumo", index=False, startrow=0)
+        ws_resumo = writer.book["resumo"]
+        fonte_negrito = Font(bold=True)
+        # Linha de total/status: texto preenchido e sem indentação inicial.
+        for row_idx in range(2, ws_resumo.max_row + 1):
+            valor_col_a = ws_resumo.cell(row=row_idx, column=1).value
+            if isinstance(valor_col_a, str) and valor_col_a.strip() and not valor_col_a.startswith("    "):
+                for col_idx in (1, 2, 3):
+                    ws_resumo.cell(row=row_idx, column=col_idx).font = fonte_negrito
     buf.seek(0)
     return buf.read()
 
@@ -114,9 +309,13 @@ def _slug(s: str) -> str:
 
 def _resolver_coluna(df: pd.DataFrame, aliases: tuple[str, ...]) -> str | None:
     mapa = {str(c): _slug(c) for c in df.columns}
-    alvo = {_slug(a) for a in aliases}
+    por_slug: dict[str, str] = {}
     for col, n in mapa.items():
-        if n in alvo:
+        if n not in por_slug:
+            por_slug[n] = col
+    for alias in aliases:
+        col = por_slug.get(_slug(alias))
+        if col is not None:
             return col
     return None
 

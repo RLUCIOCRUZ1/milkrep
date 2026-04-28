@@ -147,12 +147,22 @@ def _aplicar_filtros(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     st.subheader("Filtros")
-    c0, c00, c1, c2, c3, c4, c5 = st.columns([0.8, 0.9, 1, 1, 1, 1, 1.2])
+    c0, c00, c01, c02, c1 = st.columns([1, 1, 1.2, 1, 1.2])
+    c2, c3, c4, c5 = st.columns([1.3, 1.1, 1.3, 1.2])
 
-    def opcoes(col: str) -> list[str]:
-        if col not in df.columns:
+    def opcoes(df_base: pd.DataFrame, col: str) -> list[str]:
+        if col not in df_base.columns:
             return []
-        return sorted(df[col].dropna().astype(str).str.strip().replace("", pd.NA).dropna().unique().tolist())
+        return sorted(
+            df_base[col]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .replace("", pd.NA)
+            .dropna()
+            .unique()
+            .tolist()
+        )
 
     # Evita cópia completa da base em cada rerun (ganho de performance em bases grandes).
     df_filtrado = df
@@ -168,20 +178,30 @@ def _aplicar_filtros(df: pd.DataFrame) -> pd.DataFrame:
         if f_meses:
             df_filtrado = df_filtrado[dt.dt.month.isin(f_meses)]
 
-    f_cnpj = c1.multiselect("CNPJ", opcoes("cnpj"))
-    f_nome = c2.multiselect("Nome Fantasia", opcoes("nome_fantasia"))
-    f_preposto = c3.multiselect("Preposto", opcoes("preposto"))
-    f_desc = c4.multiselect("Descrição Modelo", opcoes("descricao_modelo"))
-    pedido_pk_txt = c5.text_input("Pedido_pk")
+    f_customer = c01.multiselect("Customer", opcoes(df_filtrado, "customer"))
+    if f_customer and "customer" in df_filtrado.columns:
+        df_filtrado = df_filtrado[df_filtrado["customer"].astype(str).isin(f_customer)]
 
+    f_store = c02.multiselect("Store", opcoes(df_filtrado, "store"))
+    if f_store and "store" in df_filtrado.columns:
+        df_filtrado = df_filtrado[df_filtrado["store"].astype(str).isin(f_store)]
+
+    f_cnpj = c1.multiselect("CNPJ", opcoes(df_filtrado, "cnpj"))
     if f_cnpj and "cnpj" in df_filtrado.columns:
         df_filtrado = df_filtrado[df_filtrado["cnpj"].astype(str).isin(f_cnpj)]
+
+    f_nome = c2.multiselect("Nome Fantasia", opcoes(df_filtrado, "nome_fantasia"))
     if f_nome and "nome_fantasia" in df_filtrado.columns:
         df_filtrado = df_filtrado[df_filtrado["nome_fantasia"].astype(str).isin(f_nome)]
+
+    f_preposto = c3.multiselect("Preposto", opcoes(df_filtrado, "preposto"))
     if f_preposto and "preposto" in df_filtrado.columns:
         df_filtrado = df_filtrado[df_filtrado["preposto"].astype(str).isin(f_preposto)]
+
+    f_desc = c4.multiselect("Descrição Modelo", opcoes(df_filtrado, "descricao_modelo"))
     if f_desc and "descricao_modelo" in df_filtrado.columns:
         df_filtrado = df_filtrado[df_filtrado["descricao_modelo"].astype(str).isin(f_desc)]
+    pedido_pk_txt = c5.text_input("Pedido_pk")
 
     if pedido_pk_txt and "pedido_pk" in df_filtrado.columns:
         ids = [x.strip() for x in pedido_pk_txt.split(",") if x.strip()]

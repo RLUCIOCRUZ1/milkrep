@@ -332,8 +332,37 @@ def _key_customer(v) -> str | None:
     if not s:
         return None
     s = re.sub(r"\s+", "", s)
-    if re.fullmatch(r"\d+(\.0+)?", s):
-        return str(int(float(s)))
+    s_num = s.replace(",", ".")
+    if re.fullmatch(r"\d+(\.\d+)?", s_num):
+        try:
+            n = float(s_num)
+            if n.is_integer():
+                return str(int(n))
+        except ValueError:
+            pass
+    return s.upper()
+
+
+def _key_store(v) -> str | None:
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    s = str(v).strip()
+    if not s:
+        return None
+    s = re.sub(r"\s+", "", s)
+    s_num = s.replace(",", ".")
+    if re.fullmatch(r"\d+(\.\d+)?", s_num):
+        try:
+            n = float(s_num)
+            if n.is_integer():
+                return str(int(n))
+        except ValueError:
+            pass
     return s.upper()
 
 
@@ -376,6 +405,22 @@ def _montar_corpo_email(referencia_cliente: str) -> str:
     )
 
 
+def _filtrar_df_por_customer_store(
+    df_vw: pd.DataFrame, customer_chave: str, store_chave: str | None
+) -> pd.DataFrame:
+    store_chave = _key_store(store_chave)
+    if store_chave:
+        df_match = df_vw[
+            (df_vw["_key_customer"] == customer_chave) & (df_vw["_key_store"] == store_chave)
+        ]
+        if not df_match.empty:
+            return df_match
+        # Fallback: compara o valor bruto de `store` como texto para cobrir diferenças de formatação.
+        store_bruto = df_vw["store"].astype(str).str.strip().str.replace(r"\s+", "", regex=True).str.upper()
+        return df_vw[(df_vw["_key_customer"] == customer_chave) & (store_bruto == str(store_chave).upper())]
+    return df_vw[df_vw["_key_customer"] == customer_chave]
+
+
 def _enviar_carteiras_email() -> None:
     inicio_exec = time.perf_counter()
     logger.info("Iniciando envio em lote de carteiras por e-mail.")
@@ -404,6 +449,7 @@ def _enviar_carteiras_email() -> None:
         return
 
     col_customer = _resolver_coluna(df_lista, ("customer", "codigo_cliente", "cliente"))
+    col_store = _resolver_coluna(df_lista, ("store", "loja", "codigo_loja", "cod_loja"))
     col_email = _resolver_coluna(df_lista, ("email", "e_mail", "mail"))
     if not col_customer or not col_email:
         logger.error("Envio em lote abortado: colunas customer/email não encontradas em lista_email.")
@@ -421,27 +467,46 @@ def _enviar_carteiras_email() -> None:
         logger.error("Envio em lote abortado: coluna customer ausente na view.")
         st.error("A view nao possui a coluna `customer` para filtrar os dados.")
         return
+    if "store" not in df_vw.columns:
+        logger.error("Envio em lote abortado: coluna store ausente na view.")
+        st.error("A view nao possui a coluna `store` para filtrar os dados.")
+        return
 
     df_vw = df_vw.copy()
     df_vw["_key_customer"] = df_vw["customer"].map(_key_customer)
+    df_vw["_key_store"] = df_vw["store"].map(_key_store)
 
-    base_envio = (
-        pd.DataFrame(
-            {
-                "customer": df_lista[col_customer].map(_key_customer),
-                "emails": df_lista[col_email].astype(str).str.strip(),
-            }
-        )
-        .dropna(subset=["customer"])
-        .drop_duplicates(subset=["customer", "emails"], keep="first")
-    )
-    base_envio["destinatarios"] = base_envio["emails"].map(_destinatarios)
+    base_envio = pd.DataFrame(
+        {
+            "customer": df_lista[col_customer].map(_key_customer),
+            "store": (
+                df_lista[col_store].map(_key_store)
+                if col_store
+                else pd.Series([None] * len(df_lista), index=df_lista.index)
+            ),
+            "destinatarios": df_lista[col_email].map(_destinatarios),
+        }
+    ).dropna(subset=["customer"])
     base_envio = base_envio[base_envio["destinatarios"].map(bool)]
+    base_envio = (
+        base_envio.groupby(["customer", "store"], dropna=False, as_index=False)["destinatarios"]
+        .agg(
+            lambda listas: sorted(
+                {
+                    email.strip().lower()
+                    for lista in listas
+                    for email in lista
+                    if isinstance(email, str) and email.strip()
+                }
+            )
+        )
+        .reset_index(drop=True)
+    )
     if base_envio.empty:
         logger.warning("Envio em lote abortado: nenhum destinatário válido na lista_email.")
         st.error("Nenhum destinatario valido encontrado na aba `lista_email`.")
         return
-    logger.info("Envio em lote iniciado com %s customers elegíveis.", len(base_envio))
+    logger.info("Envio em lote iniciado com %s combinacoes customer/store elegíveis.", len(base_envio))
 
     hoje = datetime.now().strftime("%d/%m/%Y")
     assunto = f"Carteira Skechers - {hoje}"
@@ -452,25 +517,30 @@ def _enviar_carteiras_email() -> None:
 
     for i, row in enumerate(base_envio.itertuples(index=False), start=1):
         customer = row.customer
+        store = _key_store(row.store)
         destinatarios = row.destinatarios
         ini_customer = time.perf_counter()
         progresso = 20 + int((i / max(total, 1)) * 75)
-        avancar(progresso, f"Enviando {i}/{total} para customer {customer}...")
+        alvo = f"{customer}+{store}" if store else customer
+        avancar(progresso, f"Enviando {i}/{total} para {alvo}...")
 
-        df_cliente = df_vw[df_vw["_key_customer"] == customer].drop(columns=["_key_customer"])
+        df_cliente = _filtrar_df_por_customer_store(df_vw, customer, store).drop(
+            columns=["_key_customer", "_key_store"]
+        )
         if df_cliente.empty:
             sem_dados += 1
-            logger.info("Customer %s sem dados na view. Pulando.", customer)
+            logger.info("Alvo %s sem dados na view. Pulando.", alvo)
             continue
 
         anexo = _excel_bytes(df_cliente, "vw_pedidos_itens")
-        nome_anexo = f"carteira_skechers_{customer}_{datetime.now():%Y%m%d}.xlsx"
+        sufixo_store = f"_{store}" if store else ""
+        nome_anexo = f"carteira_skechers_{customer}{sufixo_store}_{datetime.now():%Y%m%d}.xlsx"
         referencia_cliente = _referencia_cliente(df_cliente, customer)
         corpo = _montar_corpo_email(referencia_cliente)
         try:
             logger.info(
-                "Enviando customer %s para %s destinatários (%s linhas).",
-                customer,
+                "Enviando alvo %s para %s destinatários (%s linhas).",
+                alvo,
                 len(destinatarios),
                 len(df_cliente),
             )
@@ -483,13 +553,13 @@ def _enviar_carteiras_email() -> None:
             )
             enviados += 1
             logger.info(
-                "Envio customer %s concluído em %.2fs.",
-                customer,
+                "Envio alvo %s concluído em %.2fs.",
+                alvo,
                 time.perf_counter() - ini_customer,
             )
         except Exception as e:
-            logger.exception("Falha no envio para customer %s: %s", customer, e)
-            erros.append(f"{customer}: {e}")
+            logger.exception("Falha no envio para alvo %s: %s", alvo, e)
+            erros.append(f"{alvo}: {e}")
 
     avancar(100, "Processo de envio concluido.")
     st.success(
@@ -506,9 +576,13 @@ def _enviar_carteiras_email() -> None:
     )
 
 
-def _enviar_carteira_por_customer(customer_informado: str) -> None:
+def _enviar_carteira_por_customer(customer_informado: str, store_informado: str = "") -> None:
     inicio_exec = time.perf_counter()
-    logger.info("Iniciando envio por customer: entrada=%s", customer_informado)
+    logger.info(
+        "Iniciando envio por customer/store: customer=%s | store=%s",
+        customer_informado,
+        store_informado,
+    )
     ok_cfg, msg_cfg = validar_config_smtp()
     if not ok_cfg:
         logger.error("Config SMTP inválida para envio por customer: %s", msg_cfg)
@@ -516,6 +590,7 @@ def _enviar_carteira_por_customer(customer_informado: str) -> None:
         return
 
     customer_chave = _key_customer(customer_informado)
+    store_chave = _key_store(store_informado)
     if not customer_chave:
         logger.warning("Envio por customer abortado: customer inválido.")
         st.error("Informe um customer valido para envio.")
@@ -536,6 +611,7 @@ def _enviar_carteira_por_customer(customer_informado: str) -> None:
         return
 
     col_customer = _resolver_coluna(df_lista, ("customer", "codigo_cliente", "cliente"))
+    col_store = _resolver_coluna(df_lista, ("store", "loja", "codigo_loja", "cod_loja"))
     col_email = _resolver_coluna(df_lista, ("email", "e_mail", "mail"))
     if not col_customer or not col_email:
         logger.error("Envio por customer abortado: colunas customer/email ausentes.")
@@ -545,25 +621,44 @@ def _enviar_carteira_por_customer(customer_informado: str) -> None:
     base_envio = pd.DataFrame(
         {
             "customer": df_lista[col_customer].map(_key_customer),
+            "store": (
+                df_lista[col_store].map(_key_store)
+                if col_store
+                else pd.Series([None] * len(df_lista), index=df_lista.index)
+            ),
             "destinatarios": df_lista[col_email].map(_destinatarios),
         }
     ).dropna(subset=["customer"])
     base_envio = base_envio[base_envio["destinatarios"].map(bool)]
-    base_customer = base_envio[base_envio["customer"] == customer_chave]
-    if base_customer.empty:
-        logger.warning("Envio por customer abortado: customer %s sem destinatários na lista_email.", customer_chave)
-        st.error(
-            f"Nao encontrei destinatarios para o customer `{customer_chave}` na aba `lista_email`."
+    if store_chave:
+        base_customer = base_envio[
+            (base_envio["customer"] == customer_chave) & (base_envio["store"] == store_chave)
+        ]
+        rotulo_alvo = f"{customer_chave}+{store_chave}"
+        msg_destinatario = (
+            f"Nao encontrei destinatarios para `{rotulo_alvo}` na aba `lista_email`."
         )
+    else:
+        base_customer = base_envio[
+            (base_envio["customer"] == customer_chave) & (base_envio["store"].isna())
+        ]
+        rotulo_alvo = customer_chave
+        msg_destinatario = (
+            f"Nao encontrei destinatarios para o customer `{customer_chave}` "
+            "com store em branco na aba `lista_email`."
+        )
+    if base_customer.empty:
+        logger.warning("Envio por customer/store abortado: %s sem destinatários.", rotulo_alvo)
+        st.error(msg_destinatario)
         return
 
     destinatarios = sorted(
         {d for lista in base_customer["destinatarios"] for d in lista if d.strip()}
     )
     if not destinatarios:
-        logger.warning("Envio por customer abortado: customer %s sem e-mails válidos.", customer_chave)
+        logger.warning("Envio por customer/store abortado: %s sem e-mails válidos.", rotulo_alvo)
         st.error(
-            f"O customer `{customer_chave}` foi encontrado, mas sem e-mails validos para envio."
+            f"O alvo `{rotulo_alvo}` foi encontrado, mas sem e-mails validos para envio."
         )
         return
 
@@ -574,21 +669,42 @@ def _enviar_carteira_por_customer(customer_informado: str) -> None:
         st.error(f"A view `{nome_vw}` esta vazia para envio.")
         return
     if "customer" not in df_vw.columns:
-        logger.error("Envio por customer abortado: coluna customer ausente na view.")
+        logger.error("Envio por customer/store abortado: coluna customer ausente na view.")
         st.error("A view nao possui a coluna `customer` para filtrar o envio.")
+        return
+    if "store" not in df_vw.columns:
+        logger.error("Envio por customer/store abortado: coluna store ausente na view.")
+        st.error("A view nao possui a coluna `store` para filtrar o envio.")
         return
 
     df_vw = df_vw.copy()
     df_vw["_key_customer"] = df_vw["customer"].map(_key_customer)
-    df_customer = df_vw[df_vw["_key_customer"] == customer_chave].drop(columns=["_key_customer"])
+    df_vw["_key_store"] = df_vw["store"].map(_key_store)
+    df_customer = _filtrar_df_por_customer_store(df_vw, customer_chave, store_chave).drop(
+        columns=["_key_customer", "_key_store"]
+    )
     if df_customer.empty:
-        logger.warning("Envio por customer abortado: customer %s sem linhas na view.", customer_chave)
+        logger.warning("Envio por customer/store abortado: %s sem linhas na view.", rotulo_alvo)
+        stores_disponiveis = sorted(
+            {
+                str(v).strip()
+                for v in df_vw.loc[df_vw["_key_customer"] == customer_chave, "store"].dropna().tolist()
+                if str(v).strip()
+            }
+        )
+        detalhe_store = ""
+        if store_chave:
+            detalhe_store = (
+                f" Stores disponiveis para customer `{customer_chave}`: "
+                + (", ".join(stores_disponiveis[:20]) if stores_disponiveis else "nenhum")
+                + "."
+            )
         st.error(
-            f"Nao encontrei linhas na `vw_pedidos_itens` para o customer `{customer_chave}`."
+            f"Nao encontrei linhas na `vw_pedidos_itens` para `{rotulo_alvo}`.{detalhe_store}"
         )
         return
 
-    avancar(60, "Gerando anexo Excel filtrado por customer...")
+    avancar(60, "Gerando anexo Excel filtrado por customer/store...")
     anexo = _excel_bytes(df_customer, "vw_pedidos_itens")
 
     hoje = datetime.now().strftime("%d/%m/%Y")
@@ -596,11 +712,11 @@ def _enviar_carteira_por_customer(customer_informado: str) -> None:
     referencia_cliente = _referencia_cliente(df_customer, customer_chave)
     corpo = _montar_corpo_email(referencia_cliente)
 
-    avancar(85, f"Enviando carteira para customer {customer_chave}...")
+    avancar(85, f"Enviando carteira para {rotulo_alvo}...")
     try:
         logger.info(
-            "Enviando customer %s para %s destinatários (%s linhas).",
-            customer_chave,
+            "Enviando alvo %s para %s destinatários (%s linhas).",
+            rotulo_alvo,
             len(destinatarios),
             len(df_customer),
         )
@@ -609,22 +725,25 @@ def _enviar_carteira_por_customer(customer_informado: str) -> None:
             assunto=assunto,
             corpo_texto=corpo,
             anexo_bytes=anexo,
-            anexo_nome=f"carteira_skechers_{customer_chave}_{datetime.now():%Y%m%d_%H%M}.xlsx",
+            anexo_nome=(
+                f"carteira_skechers_{customer_chave}"
+                f"{'_' + store_chave if store_chave else ''}_{datetime.now():%Y%m%d_%H%M}.xlsx"
+            ),
         )
     except Exception as e:
-        logger.exception("Falha no envio por customer %s: %s", customer_chave, e)
-        st.error(f"Falha no envio da carteira para customer `{customer_chave}`: {e}")
+        logger.exception("Falha no envio por alvo %s: %s", rotulo_alvo, e)
+        st.error(f"Falha no envio da carteira para `{rotulo_alvo}`: {e}")
         return
 
     avancar(100, "Envio concluido.")
     st.success(
-        f"Carteira enviada com sucesso para o customer `{customer_chave}` "
+        f"Carteira enviada com sucesso para `{rotulo_alvo}` "
         f"({len(destinatarios)} destinatario(s), {len(df_customer)} linha(s))."
     )
     logger.info(
-        "Envio por customer finalizado em %.2fs para %s.",
+        "Envio por customer/store finalizado em %.2fs para %s.",
         time.perf_counter() - inicio_exec,
-        customer_chave,
+        rotulo_alvo,
     )
 
 
@@ -716,13 +835,21 @@ if st.button("📧 Enviar carteira por e-mail (lista_email)", use_container_widt
     _enviar_carteiras_email()
 
 st.subheader("Envio por Customer")
-customer_envio = st.text_input(
-    "Customer para envio",
-    value="",
-    help="Informe o customer. O sistema busca os e-mails na aba `lista_email`, filtra os dados e envia a carteira.",
-)
+c1_envio, c2_envio = st.columns(2)
+with c1_envio:
+    customer_envio = st.text_input(
+        "Customer para envio",
+        value="",
+        help="Informe o customer para buscar os e-mails na aba `lista_email`.",
+    )
+with c2_envio:
+    store_envio = st.text_input(
+        "Store para envio",
+        value="",
+        help="Opcional. Se informado, envia por customer+store. Se vazio, usa customer com store em branco.",
+    )
 if st.button("🧪 Enviar carteira por customer", use_container_width=True):
-    _enviar_carteira_por_customer(customer_envio)
+    _enviar_carteira_por_customer(customer_envio, store_envio)
 
 st.subheader("Navegação")
 c1, c2 = st.columns(2)

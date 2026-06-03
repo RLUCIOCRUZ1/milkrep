@@ -39,6 +39,61 @@ COLUNAS_INSERT_PEDIDOS = (
 TABELAS_COMISSAO_CANDIDATAS = ("comissao_complete",)
 
 
+def _harmonizar_layout_comissao(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compatibiliza cabeçalhos antigos/novos da aba de comissão.
+    A planilha mudou ordem e alguns rótulos; mantemos nomes canônicos estáveis.
+    """
+    if df.empty:
+        return df
+
+    out = df.copy()
+
+    # Novo "Tipo Cliente" -> antigo "Tipo de Cliente".
+    if "tipo_cliente" in out.columns and "tipo_de_cliente" not in out.columns:
+        out.rename(columns={"tipo_cliente": "tipo_de_cliente"}, inplace=True)
+
+    # Novo "Previsão" -> antigo "provisao contabil".
+    if "previsao" in out.columns and "provisao_contabil" not in out.columns:
+        out.rename(columns={"previsao": "provisao_contabil"}, inplace=True)
+
+    # Se faltar "grupo", usa "grupo_de_cliente" como fallback.
+    if "grupo" not in out.columns and "grupo_de_cliente" in out.columns:
+        out["grupo"] = out["grupo_de_cliente"]
+
+    # Duplicados Invoice/P.O: mantém ambos quando existirem (layout novo).
+    if "invoice" not in out.columns and "invoice_2" in out.columns:
+        out.rename(columns={"invoice_2": "invoice"}, inplace=True)
+    if "p_o" not in out.columns and "p_o_2" in out.columns:
+        out.rename(columns={"p_o_2": "p_o"}, inplace=True)
+
+    # Rep. Hydee só substitui Rep quando Rep não existir.
+    if "rep" not in out.columns and "rep_hydee" in out.columns:
+        out.rename(columns={"rep_hydee": "rep"}, inplace=True)
+
+    return out
+
+
+def _extrair_coluna_inexistente_postgrest(exc: Exception) -> str | None:
+    """
+    Extrai nome de coluna ausente de mensagens comuns do PostgREST/Supabase.
+    Ex.: "Could not find the 'invoice_2' column ...".
+    """
+    msg = str(exc)
+    if not msg:
+        return None
+    padroes = (
+        r"Could not find the '([^']+)' column",
+        r"column '([^']+)' does not exist",
+        r'column "([^"]+)" does not exist',
+    )
+    for p in padroes:
+        m = re.search(p, msg, flags=re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return None
+
+
 def filtrar_dataframe_pedidos_para_insert(df: pd.DataFrame) -> pd.DataFrame:
     """Mantém só colunas que existem na tabela `pedidos` (evita PGRST204)."""
     cols = [c for c in df.columns if c in COLUNAS_INSERT_PEDIDOS]
@@ -176,13 +231,14 @@ def montar_comissao_com_preposto(
 ) -> pd.DataFrame:
     """
     Aplica PROCV por código de cliente:
-    dados_comissao!O (Grupo) -> lista_vendedor!B (CUSTOMER) retornando lista_vendedor!J (PREPOSTOS).
+    dados_comissao!Cód. -> lista_vendedor!B (CUSTOMER) retornando lista_vendedor!J (PREPOSTOS).
     """
     if df_comissao.empty:
         return pd.DataFrame()
 
     dfc = df_comissao.copy()
     dfc.columns = _normalizar_colunas_unicas([str(c) for c in dfc.columns])
+    dfc = _harmonizar_layout_comissao(dfc)
 
     if df_vendedores.empty:
         dfc["preposto"] = None
@@ -200,21 +256,45 @@ def montar_comissao_com_preposto(
     chave_preposto = (
         pd.DataFrame(
             {
-                "grupo": _serie_texto_limpa(dfv[col_customer]),
+                "_lookup_customer": _serie_chave_lookup(dfv[col_customer]),
                 "preposto": _serie_texto_limpa(dfv[col_prepostos]),
             }
         )
-        .dropna(subset=["grupo"])
-        .drop_duplicates(subset=["grupo"], keep="first")
+        .dropna(subset=["_lookup_customer"])
+        .drop_duplicates(subset=["_lookup_customer"], keep="first")
     )
 
-    if "grupo" not in dfc.columns:
-        # Segurança: caso a coluna O não normalize como "grupo".
+    # Cód. do cliente (numérico) bate com CUSTOMER em lista_vendedor; Grupo costuma ser nome.
+    col_cod = _resolver_coluna_por_alias(
+        dfc, aliases=("cod", "codigo", "cod_cliente", "customer"), fallback_idx=None
+    )
+    if col_cod is not None:
+        dfc["_lookup_customer"] = _serie_chave_lookup(dfc[col_cod])
+        dfc = dfc.merge(chave_preposto, on="_lookup_customer", how="left")
+        dfc.drop(columns=["_lookup_customer"], inplace=True, errors="ignore")
+        return dfc
+
+    col_grupo = _resolver_coluna_por_alias(
+        dfc, aliases=("grupo", "grupo_de_cliente"), fallback_idx=None
+    )
+    if col_grupo is None:
         dfc["preposto"] = None
         return dfc
 
-    dfc["grupo"] = _serie_texto_limpa(dfc["grupo"])
-    dfc = dfc.merge(chave_preposto, on="grupo", how="left")
+    # Fallback legado: grupo textual igual ao CUSTOMER na lista_vendedor.
+    mapa_grupo = (
+        pd.DataFrame(
+            {
+                "_lookup_grupo": _serie_chave_lookup(dfv[col_customer]),
+                "preposto": _serie_texto_limpa(dfv[col_prepostos]),
+            }
+        )
+        .dropna(subset=["_lookup_grupo"])
+        .drop_duplicates(subset=["_lookup_grupo"], keep="first")
+    )
+    dfc["_lookup_grupo"] = _serie_texto_limpa(dfc[col_grupo])
+    dfc = dfc.merge(mapa_grupo, on="_lookup_grupo", how="left")
+    dfc.drop(columns=["_lookup_grupo"], inplace=True, errors="ignore")
     return dfc
 
 
@@ -417,16 +497,28 @@ def salvar_comissao(df_comissao_final: pd.DataFrame) -> tuple[str, int]:
 
     ultimo_erro = None
     for nome_tabela in TABELAS_COMISSAO_CANDIDATAS:
-        try:
-            _limpar_tabela_generica(nome_tabela)
-            tam_lote = 500
-            for i in range(0, len(dados), tam_lote):
-                lote = dados[i : i + tam_lote]
-                supabase.table(nome_tabela).insert(lote).execute()
-            return nome_tabela, len(dados)
-        except Exception as e:
-            ultimo_erro = e
-            continue
+        dados_tabela = dados
+        while True:
+            try:
+                _limpar_tabela_generica(nome_tabela)
+                tam_lote = 500
+                for i in range(0, len(dados_tabela), tam_lote):
+                    lote = dados_tabela[i : i + tam_lote]
+                    supabase.table(nome_tabela).insert(lote).execute()
+                return nome_tabela, len(dados_tabela)
+            except Exception as e:
+                # Layout da planilha pode trazer colunas novas ainda não criadas no Supabase.
+                col_inexistente = _extrair_coluna_inexistente_postgrest(e)
+                if col_inexistente and any(
+                    col_inexistente in row for row in dados_tabela
+                ):
+                    dados_tabela = [
+                        {k: v for k, v in row.items() if k != col_inexistente}
+                        for row in dados_tabela
+                    ]
+                    continue
+                ultimo_erro = e
+                break
 
     if ultimo_erro:
         raise ultimo_erro

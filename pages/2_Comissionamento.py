@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+from comissao_colunas import preparar_comissao_para_exibicao
 from database import carregar_comissionamento
 
 st.set_page_config(page_title="Comissionamento", layout="wide")
@@ -137,10 +138,11 @@ if erro:
     st.error(f"Nao foi possivel carregar comissionamento: {erro}")
 else:
     df = _normalizar_doc_exibicao(df)
+    df_exibir = preparar_comissao_para_exibicao(df)
     st.caption(f"Fonte dos dados: `{nome_origem}` | Total de linhas: {len(df)}")
     exibir_tabela = st.checkbox(
         "Exibir tabela detalhada",
-        value=False,
+        value=True,
         help="Desative para acelerar a pagina quando não precisar visualizar linhas.",
     )
     if exibir_tabela:
@@ -149,10 +151,10 @@ else:
             options=[200, 500, 1000, 2000, 5000],
             index=1,
         )
-        st.dataframe(df.head(linhas_exibir), use_container_width=True, height=520)
+        st.dataframe(df_exibir.head(linhas_exibir), use_container_width=True, height=520)
     st.download_button(
         label="Exportar comissionamento para Excel (.xlsx)",
-        data=_excel_bytes(df, nome_origem or "comissionamento"),
+        data=_excel_bytes(df_exibir, nome_origem or "comissionamento"),
         file_name=f"comissionamento_{datetime.now():%Y%m%d_%H%M}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )

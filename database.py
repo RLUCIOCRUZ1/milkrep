@@ -53,9 +53,17 @@ def _harmonizar_layout_comissao(df: pd.DataFrame) -> pd.DataFrame:
     if "tipo_cliente" in out.columns and "tipo_de_cliente" not in out.columns:
         out.rename(columns={"tipo_cliente": "tipo_de_cliente"}, inplace=True)
 
-    # Novo "Previsão" -> antigo "provisao contabil".
-    if "previsao" in out.columns and "provisao_contabil" not in out.columns:
-        out.rename(columns={"previsao": "provisao_contabil"}, inplace=True)
+    # Cabeçalho "%" normaliza como slug vazio e vira "coluna" (nome da coluna no Supabase).
+
+    # Planilha: "provisao contabil" / "Previsão" -> coluna `previsao` no Supabase.
+    if "provisao_contabil" in out.columns:
+        if "previsao" not in out.columns:
+            out.rename(columns={"provisao_contabil": "previsao"}, inplace=True)
+        else:
+            out["previsao"] = out["previsao"].where(
+                out["previsao"].notna(), out["provisao_contabil"]
+            )
+            out.drop(columns=["provisao_contabil"], inplace=True)
 
     # Se faltar "grupo", usa "grupo_de_cliente" como fallback.
     if "grupo" not in out.columns and "grupo_de_cliente" in out.columns:

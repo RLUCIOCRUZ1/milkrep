@@ -32,7 +32,7 @@ _COLUNAS_LAYOUT_NOVO: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("invoice_2", "Invoice", ()),
     ("p_o_2", "P.O", ("po_2",)),
     ("percentual", "%", ("coluna", "percent", "perc")),
-    ("previsao", "Previsão", ("provisao_contabil", "provisao")),
+    ("previsao", "provisao contabil", ("provisao_contabil", "provisao")),
     ("tipo_cliente", "Tipo Cliente", ("tipo_de_cliente",)),
     ("preposto", "Preposto", ()),
 )

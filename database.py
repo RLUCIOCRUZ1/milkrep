@@ -1,5 +1,6 @@
 from datetime import date, datetime
 import re
+import time
 
 import pandas as pd
 from colunas import COLUNAS_EXTRAS_PEDIDO, normalizar_header
@@ -108,7 +109,45 @@ def filtrar_dataframe_pedidos_para_insert(df: pd.DataFrame) -> pd.DataFrame:
     return df[cols].copy()
 
 
-def _carregar_tabela_completa(nome_tabela: str, page_size: int = 1000) -> list[dict]:
+def _erro_transiente_supabase(exc: Exception) -> bool:
+    msg = f"{type(exc).__name__} {exc}".lower()
+    return any(
+        s in msg
+        for s in (
+            "connectionterminated",
+            "connection reset",
+            "connection aborted",
+            "timeout",
+            "temporarily unavailable",
+            "503",
+            "502",
+            "504",
+            "remoteprotocolerror",
+            "readerror",
+        )
+    )
+
+
+def _executar_supabase_com_retry(fn, tentativas: int = 4):
+    ultimo = None
+    for i in range(tentativas):
+        try:
+            return fn()
+        except Exception as e:
+            ultimo = e
+            if i < tentativas - 1 and _erro_transiente_supabase(e):
+                time.sleep(1.5 * (i + 1))
+                continue
+            raise
+    if ultimo:
+        raise ultimo
+
+
+def _carregar_tabela_completa(
+    nome_tabela: str,
+    page_size: int = 500,
+    filtros: dict[str, str] | None = None,
+) -> list[dict]:
     """
     Lê todos os registros da tabela/view em páginas.
     Evita limite padrão de linhas por chamada no PostgREST.
@@ -117,9 +156,15 @@ def _carregar_tabela_completa(nome_tabela: str, page_size: int = 1000) -> list[d
     start = 0
     while True:
         end = start + page_size - 1
-        response = (
-            supabase.table(nome_tabela).select("*").range(start, end).execute()
-        )
+
+        def _pagina():
+            req = supabase.table(nome_tabela).select("*")
+            if filtros:
+                for col, val in filtros.items():
+                    req = req.eq(col, val)
+            return req.range(start, end).execute()
+
+        response = _executar_supabase_com_retry(_pagina)
         chunk = response.data or []
         if not chunk:
             break
@@ -128,6 +173,30 @@ def _carregar_tabela_completa(nome_tabela: str, page_size: int = 1000) -> list[d
             break
         start += page_size
     return registros
+
+
+def carregar_vw_pedido_itens_filtrado(
+    customer: str | None = None,
+    store: str | None = None,
+) -> tuple[pd.DataFrame, str]:
+    """
+    Carrega vw_pedidos_itens com filtro no servidor (menos dados, mais estável no envio de e-mail).
+    """
+    nome = "vw_pedidos_itens"
+    filtros: dict[str, str] = {}
+    if customer:
+        filtros["customer"] = str(customer)
+    if store:
+        filtros["store"] = str(store)
+    try:
+        dados = _carregar_tabela_completa(nome, filtros=filtros or None)
+        return pd.DataFrame(dados), nome
+    except Exception as e:
+        raise Exception(
+            f"Não foi possível carregar `{nome}`"
+            + (f" (customer={customer}, store={store})" if filtros else "")
+            + f". Erro original: {e}"
+        ) from e
 
 
 def carregar_vw_pedido_itens() -> tuple[pd.DataFrame, str]:

@@ -13,7 +13,7 @@ from openpyxl.styles import Font
 
 from colunas import COLUNAS_EXTRAS_PEDIDO, alinhar_colunas_extras, mapear_colunas_clientes
 from database import (
-    carregar_vw_pedido_itens,
+    carregar_vw_pedido_itens_filtrado,
     limpar_dados_automacao,
     montar_comissao_com_preposto,
     montar_pedidos_com_preposto,
@@ -456,26 +456,6 @@ def _enviar_carteiras_email() -> None:
         st.error("Nao encontrei as colunas `customer` e `email` na aba `lista_email`.")
         return
 
-    avancar(20, "Carregando vw_pedidos_itens...")
-    df_vw, nome_vw = carregar_vw_pedido_itens()
-    if df_vw.empty:
-        logger.warning("Envio em lote abortado: view %s vazia.", nome_vw)
-        st.error(f"A view `{nome_vw}` esta vazia.")
-        return
-
-    if "customer" not in df_vw.columns:
-        logger.error("Envio em lote abortado: coluna customer ausente na view.")
-        st.error("A view nao possui a coluna `customer` para filtrar os dados.")
-        return
-    if "store" not in df_vw.columns:
-        logger.error("Envio em lote abortado: coluna store ausente na view.")
-        st.error("A view nao possui a coluna `store` para filtrar os dados.")
-        return
-
-    df_vw = df_vw.copy()
-    df_vw["_key_customer"] = df_vw["customer"].map(_key_customer)
-    df_vw["_key_store"] = df_vw["store"].map(_key_store)
-
     base_envio = pd.DataFrame(
         {
             "customer": df_lista[col_customer].map(_key_customer),
@@ -508,6 +488,7 @@ def _enviar_carteiras_email() -> None:
         return
     logger.info("Envio em lote iniciado com %s combinacoes customer/store elegíveis.", len(base_envio))
 
+    avancar(20, "Carregando dados por cliente...")
     hoje = datetime.now().strftime("%d/%m/%Y")
     assunto = f"Carteira Skechers - {hoje}"
     enviados = 0
@@ -524,6 +505,19 @@ def _enviar_carteiras_email() -> None:
         alvo = f"{customer}+{store}" if store else customer
         avancar(progresso, f"Enviando {i}/{total} para {alvo}...")
 
+        try:
+            df_vw, _ = carregar_vw_pedido_itens_filtrado(customer, store)
+        except Exception as e:
+            logger.exception("Falha ao carregar view para alvo %s: %s", alvo, e)
+            erros.append(f"{alvo}: {e}")
+            continue
+        if df_vw.empty or "customer" not in df_vw.columns:
+            sem_dados += 1
+            logger.info("Alvo %s sem dados na view. Pulando.", alvo)
+            continue
+        df_vw = df_vw.copy()
+        df_vw["_key_customer"] = df_vw["customer"].map(_key_customer)
+        df_vw["_key_store"] = df_vw["store"].map(_key_store)
         df_cliente = _filtrar_df_por_customer_store(df_vw, customer, store).drop(
             columns=["_key_customer", "_key_store"]
         )
@@ -662,11 +656,16 @@ def _enviar_carteira_por_customer(customer_informado: str, store_informado: str 
         )
         return
 
-    avancar(35, "Carregando dados da vw_pedidos_itens...")
-    df_vw, nome_vw = carregar_vw_pedido_itens()
+    avancar(35, "Carregando dados da carteira...")
+    try:
+        df_vw, nome_vw = carregar_vw_pedido_itens_filtrado(customer_chave, store_chave)
+    except Exception as e:
+        logger.exception("Falha ao carregar view para envio: %s", e)
+        st.error(f"Nao foi possivel carregar a view de pedidos: {e}")
+        return
     if df_vw.empty:
-        logger.warning("Envio por customer abortado: view %s vazia.", nome_vw)
-        st.error(f"A view `{nome_vw}` esta vazia para envio.")
+        logger.warning("Envio por customer abortado: view vazia para o alvo.")
+        st.error("Nao ha dados na carteira para o customer/store informado.")
         return
     if "customer" not in df_vw.columns:
         logger.error("Envio por customer/store abortado: coluna customer ausente na view.")

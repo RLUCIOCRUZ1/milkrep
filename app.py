@@ -94,6 +94,35 @@ st.markdown(
     unsafe_allow_html=True,
 )
 COLUNAS_OBRIGATORIAS = ("customer", "store", "customer_name", "order_no", "style", "rsn")
+# Ordem das colunas no Excel enviado por e-mail (só as que existirem na view).
+COLUNAS_EXCEL_CARTEIRA = (
+    "store",
+    "nome_fantasia",
+    "cnpj",
+    "customer_name",
+    "descricao_modelo",
+    "color",
+    "genero",
+    "preco_liquido",
+    "total",
+    "data_faturamento",
+    "tamanho",
+    "quantidade",
+    "preposto",
+)
+# Valores reais no banco: MENS / WOMENS / BOYS / GIRLS
+TRADUCAO_GENERO = {
+    "mens": "Masculino",
+    "womens": "Feminino",
+    "boys": "Infantil masculino",
+    "girls": "Infantil feminino",
+}
+ORDEM_GENERO_RESUMO = (
+    "Masculino",
+    "Feminino",
+    "Infantil masculino",
+    "Infantil feminino",
+)
 ASSINATURA_EMAIL = (
     "Atenciosamente,\n\n"
     "Maísa Gomes\n"
@@ -191,6 +220,33 @@ def _status_para_resumo(status_original: str) -> tuple[str, int, int]:
     return texto or "Sem informação", 1, 999
 
 
+def _traduzir_genero(valor) -> str:
+    bruto = str(valor).strip() if valor is not None else ""
+    if not bruto or bruto.lower() in {"nan", "none", "null"}:
+        return "Sem informação"
+    chave = _normalizar_texto(bruto)
+    return TRADUCAO_GENERO.get(chave, bruto)
+
+
+def _preparar_df_excel_carteira(df: pd.DataFrame) -> pd.DataFrame:
+    """Seleciona e ordena colunas do anexo; traduz gênero."""
+    base = df.copy()
+    colunas_presentes: list[str] = []
+    for nome in COLUNAS_EXCEL_CARTEIRA:
+        col = _resolver_coluna(base, (nome,))
+        if col is not None and col not in colunas_presentes:
+            colunas_presentes.append(col)
+
+    if not colunas_presentes:
+        return base
+
+    saida = base[colunas_presentes].copy()
+    col_genero = _resolver_coluna(saida, ("genero",))
+    if col_genero is not None:
+        saida[col_genero] = saida[col_genero].map(_traduzir_genero)
+    return saida
+
+
 def _montar_resumo_excel(df: pd.DataFrame) -> pd.DataFrame:
     base = df.copy()
     col_status = _resolver_coluna(base, ("status_pedido", "status"))
@@ -285,20 +341,127 @@ def _montar_resumo_excel(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(linhas_resumo, columns=["status_pedido", "quantidade", "valor"])
 
 
+def _montar_resumo_genero_excel(df: pd.DataFrame) -> pd.DataFrame:
+    """Resumo por gênero, com detalhe por mês de liberação (como descrição no status)."""
+    base = df.copy()
+    col_genero = _resolver_coluna(base, ("genero",))
+    col_status = _resolver_coluna(base, ("status_pedido", "status"))
+    col_qtd = _resolver_coluna(base, ("quantidade", "qtd", "quantity"))
+    col_valor = _resolver_coluna(base, ("valor", "total", "valor_total"))
+
+    if col_genero is None:
+        base["genero"] = "Sem informação"
+        col_genero = "genero"
+
+    if col_status is None and "rsn" in base.columns:
+        base["status_pedido"] = base.apply(
+            lambda row: tratar_status(row.get("rsn"), row.get("pick_date")), axis=1
+        )
+        col_status = "status_pedido"
+    if col_status is None:
+        base["status_pedido"] = "Sem informação"
+        col_status = "status_pedido"
+
+    if col_qtd:
+        base["__qtd_num"] = _to_float_series(base[col_qtd])
+    else:
+        base["__qtd_num"] = 0
+
+    if col_valor:
+        base["__valor_num"] = _to_float_series(base[col_valor])
+    else:
+        base["__valor_num"] = 0
+
+    base["genero_resumo"] = base[col_genero].map(_traduzir_genero)
+    status_meta = base[col_status].map(_status_para_resumo)
+    base["status_resumo"] = status_meta.map(lambda x: x[0])
+    base["grupo_tipo"] = status_meta.map(lambda x: x[1])
+    base["ordem_mes"] = status_meta.map(lambda x: x[2])
+
+    ordem_genero = {nome: i for i, nome in enumerate(ORDEM_GENERO_RESUMO)}
+    genero_ordenado = (
+        base.groupby("genero_resumo", dropna=False, as_index=False)[["__qtd_num", "__valor_num"]]
+        .sum()
+        .rename(columns={"__qtd_num": "quantidade", "__valor_num": "valor"})
+    )
+    genero_ordenado["__ordem"] = genero_ordenado["genero_resumo"].map(
+        lambda g: ordem_genero.get(str(g), 100)
+    )
+    genero_ordenado = genero_ordenado.sort_values(
+        ["__ordem", "genero_resumo"], ascending=True
+    )
+
+    detalhes_liberacao = (
+        base.groupby(
+            ["genero_resumo", "status_resumo", "grupo_tipo", "ordem_mes"],
+            dropna=False,
+            as_index=False,
+        )[["__qtd_num", "__valor_num"]]
+        .sum()
+        .rename(columns={"__qtd_num": "quantidade", "__valor_num": "valor"})
+        .sort_values(
+            ["genero_resumo", "grupo_tipo", "ordem_mes", "status_resumo"],
+            ascending=True,
+        )
+    )
+
+    linhas: list[dict[str, str]] = []
+    for row_genero in genero_ordenado.itertuples(index=False):
+        genero_nome = str(row_genero.genero_resumo).strip() or "Sem informação"
+        linhas.append(
+            {
+                "genero": genero_nome,
+                "quantidade": _format_pecas(row_genero.quantidade),
+                "valor": _format_brl(row_genero.valor),
+            }
+        )
+        detalhes = detalhes_liberacao[detalhes_liberacao["genero_resumo"] == genero_nome]
+        for row_lib in detalhes.itertuples(index=False):
+            nome_lib = str(row_lib.status_resumo).strip() or "Sem informação"
+            linhas.append(
+                {
+                    "genero": f"    {nome_lib}",
+                    "quantidade": _format_pecas(row_lib.quantidade),
+                    "valor": _format_brl(row_lib.valor),
+                }
+            )
+        linhas.append({"genero": "", "quantidade": "", "valor": ""})
+
+    if linhas and not linhas[-1]["genero"]:
+        linhas.pop()
+
+    return pd.DataFrame(linhas, columns=["genero", "quantidade", "valor"])
+
+
 def _excel_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
+    # Resumos usam o DF completo (precisa de status_pedido etc.).
     resumo_df = _montar_resumo_excel(df)
+    resumo_genero_df = _montar_resumo_genero_excel(df)
+    df_anexo = _preparar_df_excel_carteira(df)
+
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name=sheet_name, index=False)
-        resumo_df.to_excel(writer, sheet_name="resumo", index=False, startrow=0)
+        df_anexo.to_excel(writer, sheet_name=sheet_name, index=False)
+        resumo_df.to_excel(writer, sheet_name="resumo", index=False, startrow=0, startcol=0)
+        # Resumo de gênero ao lado (coluna E = índice 4), com 1 coluna em branco.
+        resumo_genero_df.to_excel(
+            writer, sheet_name="resumo", index=False, startrow=0, startcol=4
+        )
         ws_resumo = writer.book["resumo"]
         fonte_negrito = Font(bold=True)
-        # Linha de total/status: texto preenchido e sem indentação inicial.
+        # Totais (status à esquerda, gênero à direita): sem indentação = negrito.
         for row_idx in range(2, ws_resumo.max_row + 1):
-            valor_col_a = ws_resumo.cell(row=row_idx, column=1).value
-            if isinstance(valor_col_a, str) and valor_col_a.strip() and not valor_col_a.startswith("    "):
-                for col_idx in (1, 2, 3):
-                    ws_resumo.cell(row=row_idx, column=col_idx).font = fonte_negrito
+            for col_base in (1, 5):
+                valor = ws_resumo.cell(row=row_idx, column=col_base).value
+                if (
+                    isinstance(valor, str)
+                    and valor.strip()
+                    and not valor.startswith("    ")
+                ):
+                    for col_idx in (col_base, col_base + 1, col_base + 2):
+                        ws_resumo.cell(row=row_idx, column=col_idx).font = fonte_negrito
+        for col_idx in (5, 6, 7):
+            ws_resumo.cell(row=1, column=col_idx).font = fonte_negrito
     buf.seek(0)
     return buf.read()
 

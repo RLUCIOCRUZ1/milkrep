@@ -100,6 +100,7 @@ COLUNAS_EXCEL_CARTEIRA = (
     "nome_fantasia",
     "cnpj",
     "customer_name",
+    "style",
     "descricao_modelo",
     "color",
     "genero",
@@ -110,6 +111,10 @@ COLUNAS_EXCEL_CARTEIRA = (
     "quantidade",
     "preposto",
 )
+ROTULOS_EXCEL_CARTEIRA = {
+    "style": "referencia",
+    "color": "cor",
+}
 # Valores reais no banco: MENS / WOMENS / BOYS / GIRLS
 TRADUCAO_GENERO = {
     "mens": "Masculino",
@@ -228,8 +233,38 @@ def _traduzir_genero(valor) -> str:
     return TRADUCAO_GENERO.get(chave, bruto)
 
 
+def _aplicar_metricas_qtd_preco(base: pd.DataFrame) -> pd.DataFrame:
+    """Prepara quantidade e preço líquido para o resumo (valor = qtd × média do preço)."""
+    out = base.copy()
+    col_qtd = _resolver_coluna(out, ("quantidade", "qtd", "quantity"))
+    col_preco = _resolver_coluna(out, ("preco_liquido", "preço_liquido", "price_liquido"))
+    if col_qtd:
+        out["__qtd_num"] = _to_float_series(out[col_qtd])
+    else:
+        out["__qtd_num"] = 0.0
+    if col_preco:
+        out["__preco_num"] = _to_float_series(out[col_preco])
+    else:
+        out["__preco_num"] = 0.0
+    out["__valor_linha"] = out["__qtd_num"] * out["__preco_num"]
+    return out
+
+
+def _agregar_qtd_custo_valor(grupo: pd.DataFrame) -> pd.Series:
+    """quantidade = soma; custo = média ponderada do preço líquido; valor = qtd × custo."""
+    qtd = float(grupo["__qtd_num"].sum())
+    valor_linhas = float(grupo["__valor_linha"].sum())
+    if qtd > 0:
+        custo = valor_linhas / qtd
+    elif len(grupo):
+        custo = float(grupo["__preco_num"].mean())
+    else:
+        custo = 0.0
+    return pd.Series({"quantidade": qtd, "custo": custo, "valor": qtd * custo})
+
+
 def _preparar_df_excel_carteira(df: pd.DataFrame) -> pd.DataFrame:
-    """Seleciona e ordena colunas do anexo; traduz gênero."""
+    """Seleciona e ordena colunas do anexo; traduz gênero; renomeia style/color."""
     base = df.copy()
     colunas_presentes: list[str] = []
     for nome in COLUNAS_EXCEL_CARTEIRA:
@@ -244,15 +279,21 @@ def _preparar_df_excel_carteira(df: pd.DataFrame) -> pd.DataFrame:
     col_genero = _resolver_coluna(saida, ("genero",))
     if col_genero is not None:
         saida[col_genero] = saida[col_genero].map(_traduzir_genero)
+
+    rename: dict[str, str] = {}
+    for origem, rotulo in ROTULOS_EXCEL_CARTEIRA.items():
+        col = _resolver_coluna(saida, (origem,))
+        if col is not None:
+            rename[col] = rotulo
+    if rename:
+        saida = saida.rename(columns=rename)
     return saida
 
 
 def _montar_resumo_excel(df: pd.DataFrame) -> pd.DataFrame:
-    base = df.copy()
+    base = _aplicar_metricas_qtd_preco(df)
     col_status = _resolver_coluna(base, ("status_pedido", "status"))
     col_modelo = _resolver_coluna(base, ("descricao_modelo",))
-    col_qtd = _resolver_coluna(base, ("quantidade", "qtd", "quantity"))
-    col_valor = _resolver_coluna(base, ("valor", "total", "valor_total"))
 
     if col_status is None and "rsn" in base.columns:
         base["status_pedido"] = base.apply(
@@ -267,50 +308,33 @@ def _montar_resumo_excel(df: pd.DataFrame) -> pd.DataFrame:
         base["descricao_modelo"] = "Sem informação"
         col_modelo = "descricao_modelo"
 
-    if col_qtd:
-        base["__qtd_num"] = _to_float_series(base[col_qtd])
-    else:
-        base["__qtd_num"] = 0
-
-    if col_valor:
-        base["__valor_num"] = _to_float_series(base[col_valor])
-    else:
-        base["__valor_num"] = 0
-
     status_meta = base[col_status].map(_status_para_resumo)
     base["status_resumo"] = status_meta.map(lambda x: x[0])
     base["grupo_tipo"] = status_meta.map(lambda x: x[1])
     base["ordem_mes"] = status_meta.map(lambda x: x[2])
 
     status_ordenado = (
-        base.groupby("status_resumo", dropna=False, as_index=False)[
-            ["__qtd_num", "__valor_num", "grupo_tipo", "ordem_mes"]
-        ]
-        .agg(
-            {
-                "__qtd_num": "sum",
-                "__valor_num": "sum",
-                "grupo_tipo": "min",
-                "ordem_mes": "min",
-            }
-        )
-        .rename(columns={"__qtd_num": "quantidade", "__valor_num": "valor"})
-        .sort_values(["grupo_tipo", "ordem_mes", "status_resumo"], ascending=True)
+        base.groupby("status_resumo", dropna=False, group_keys=False)
+        .apply(_agregar_qtd_custo_valor, include_groups=False)
+        .reset_index()
+    )
+    meta_status = (
+        base.groupby("status_resumo", dropna=False, as_index=False)[["grupo_tipo", "ordem_mes"]]
+        .min()
+    )
+    status_ordenado = status_ordenado.merge(meta_status, on="status_resumo", how="left")
+    status_ordenado = status_ordenado.sort_values(
+        ["grupo_tipo", "ordem_mes", "status_resumo"], ascending=True
     )
 
     detalhes_modelo = (
-        base.groupby(["status_resumo", col_modelo], dropna=False, as_index=False)[
-            ["__qtd_num", "__valor_num"]
-        ]
-        .sum()
-        .rename(
-            columns={
-                col_modelo: "descricao_modelo",
-                "__qtd_num": "quantidade",
-                "__valor_num": "valor",
-            }
+        base.groupby(["status_resumo", col_modelo], dropna=False, group_keys=False)
+        .apply(_agregar_qtd_custo_valor, include_groups=False)
+        .reset_index()
+        .rename(columns={col_modelo: "descricao_modelo"})
+        .sort_values(
+            ["status_resumo", "valor", "quantidade"], ascending=[True, False, False]
         )
-        .sort_values(["status_resumo", "valor", "quantidade"], ascending=[True, False, False])
     )
 
     linhas_resumo: list[dict[str, str]] = []
@@ -320,6 +344,7 @@ def _montar_resumo_excel(df: pd.DataFrame) -> pd.DataFrame:
             {
                 "status_pedido": status_nome,
                 "quantidade": _format_pecas(row_status["quantidade"]),
+                "custo": _format_brl(row_status["custo"]),
                 "valor": _format_brl(row_status["valor"]),
             }
         )
@@ -330,24 +355,27 @@ def _montar_resumo_excel(df: pd.DataFrame) -> pd.DataFrame:
                 {
                     "status_pedido": f"    {nome_modelo}",
                     "quantidade": _format_pecas(row_modelo.quantidade),
+                    "custo": _format_brl(row_modelo.custo),
                     "valor": _format_brl(row_modelo.valor),
                 }
             )
-        linhas_resumo.append({"status_pedido": "", "quantidade": "", "valor": ""})
+        linhas_resumo.append(
+            {"status_pedido": "", "quantidade": "", "custo": "", "valor": ""}
+        )
 
     if linhas_resumo and not linhas_resumo[-1]["status_pedido"]:
         linhas_resumo.pop()
 
-    return pd.DataFrame(linhas_resumo, columns=["status_pedido", "quantidade", "valor"])
+    return pd.DataFrame(
+        linhas_resumo, columns=["status_pedido", "quantidade", "custo", "valor"]
+    )
 
 
 def _montar_resumo_genero_excel(df: pd.DataFrame) -> pd.DataFrame:
     """Resumo por gênero, com detalhe por mês de liberação (como descrição no status)."""
-    base = df.copy()
+    base = _aplicar_metricas_qtd_preco(df)
     col_genero = _resolver_coluna(base, ("genero",))
     col_status = _resolver_coluna(base, ("status_pedido", "status"))
-    col_qtd = _resolver_coluna(base, ("quantidade", "qtd", "quantity"))
-    col_valor = _resolver_coluna(base, ("valor", "total", "valor_total"))
 
     if col_genero is None:
         base["genero"] = "Sem informação"
@@ -362,16 +390,6 @@ def _montar_resumo_genero_excel(df: pd.DataFrame) -> pd.DataFrame:
         base["status_pedido"] = "Sem informação"
         col_status = "status_pedido"
 
-    if col_qtd:
-        base["__qtd_num"] = _to_float_series(base[col_qtd])
-    else:
-        base["__qtd_num"] = 0
-
-    if col_valor:
-        base["__valor_num"] = _to_float_series(base[col_valor])
-    else:
-        base["__valor_num"] = 0
-
     base["genero_resumo"] = base[col_genero].map(_traduzir_genero)
     status_meta = base[col_status].map(_status_para_resumo)
     base["status_resumo"] = status_meta.map(lambda x: x[0])
@@ -380,9 +398,9 @@ def _montar_resumo_genero_excel(df: pd.DataFrame) -> pd.DataFrame:
 
     ordem_genero = {nome: i for i, nome in enumerate(ORDEM_GENERO_RESUMO)}
     genero_ordenado = (
-        base.groupby("genero_resumo", dropna=False, as_index=False)[["__qtd_num", "__valor_num"]]
-        .sum()
-        .rename(columns={"__qtd_num": "quantidade", "__valor_num": "valor"})
+        base.groupby("genero_resumo", dropna=False, group_keys=False)
+        .apply(_agregar_qtd_custo_valor, include_groups=False)
+        .reset_index()
     )
     genero_ordenado["__ordem"] = genero_ordenado["genero_resumo"].map(
         lambda g: ordem_genero.get(str(g), 100)
@@ -395,10 +413,10 @@ def _montar_resumo_genero_excel(df: pd.DataFrame) -> pd.DataFrame:
         base.groupby(
             ["genero_resumo", "status_resumo", "grupo_tipo", "ordem_mes"],
             dropna=False,
-            as_index=False,
-        )[["__qtd_num", "__valor_num"]]
-        .sum()
-        .rename(columns={"__qtd_num": "quantidade", "__valor_num": "valor"})
+            group_keys=False,
+        )
+        .apply(_agregar_qtd_custo_valor, include_groups=False)
+        .reset_index()
         .sort_values(
             ["genero_resumo", "grupo_tipo", "ordem_mes", "status_resumo"],
             ascending=True,
@@ -412,6 +430,7 @@ def _montar_resumo_genero_excel(df: pd.DataFrame) -> pd.DataFrame:
             {
                 "genero": genero_nome,
                 "quantidade": _format_pecas(row_genero.quantidade),
+                "custo": _format_brl(row_genero.custo),
                 "valor": _format_brl(row_genero.valor),
             }
         )
@@ -422,15 +441,16 @@ def _montar_resumo_genero_excel(df: pd.DataFrame) -> pd.DataFrame:
                 {
                     "genero": f"    {nome_lib}",
                     "quantidade": _format_pecas(row_lib.quantidade),
+                    "custo": _format_brl(row_lib.custo),
                     "valor": _format_brl(row_lib.valor),
                 }
             )
-        linhas.append({"genero": "", "quantidade": "", "valor": ""})
+        linhas.append({"genero": "", "quantidade": "", "custo": "", "valor": ""})
 
     if linhas and not linhas[-1]["genero"]:
         linhas.pop()
 
-    return pd.DataFrame(linhas, columns=["genero", "quantidade", "valor"])
+    return pd.DataFrame(linhas, columns=["genero", "quantidade", "custo", "valor"])
 
 
 def _excel_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
@@ -443,24 +463,24 @@ def _excel_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df_anexo.to_excel(writer, sheet_name=sheet_name, index=False)
         resumo_df.to_excel(writer, sheet_name="resumo", index=False, startrow=0, startcol=0)
-        # Resumo de gênero ao lado (coluna E = índice 4), com 1 coluna em branco.
+        # Resumo de gênero ao lado (coluna F = índice 5), com 1 coluna em branco.
         resumo_genero_df.to_excel(
-            writer, sheet_name="resumo", index=False, startrow=0, startcol=4
+            writer, sheet_name="resumo", index=False, startrow=0, startcol=5
         )
         ws_resumo = writer.book["resumo"]
         fonte_negrito = Font(bold=True)
         # Totais (status à esquerda, gênero à direita): sem indentação = negrito.
         for row_idx in range(2, ws_resumo.max_row + 1):
-            for col_base in (1, 5):
+            for col_base in (1, 6):
                 valor = ws_resumo.cell(row=row_idx, column=col_base).value
                 if (
                     isinstance(valor, str)
                     and valor.strip()
                     and not valor.startswith("    ")
                 ):
-                    for col_idx in (col_base, col_base + 1, col_base + 2):
+                    for col_idx in range(col_base, col_base + 4):
                         ws_resumo.cell(row=row_idx, column=col_idx).font = fonte_negrito
-        for col_idx in (5, 6, 7):
+        for col_idx in (6, 7, 8, 9):
             ws_resumo.cell(row=1, column=col_idx).font = fonte_negrito
     buf.seek(0)
     return buf.read()

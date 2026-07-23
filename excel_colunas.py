@@ -16,6 +16,8 @@ RENOME_COLUNAS_CANONICAS_SUPABASE: dict[str, str] = {}
 PEDIDOS_COLUNA_POR_LETRA: dict[str, str] = {
     "D": "store",
     "E": "customer_name",
+    "M": "style",
+    "N": "color",
     "O": "descricao_modelo",
     "Q": "genero",
     "V": "preco_bruto",

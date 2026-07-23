@@ -81,6 +81,7 @@ COLUNAS_EXTRAS_PEDIDO = (
     "status_customer",
     "campanha",
     "confirmado",
+    "color",
 )
 
 COLUNAS_RESERVADAS = frozenset(ALIASES.keys())
@@ -117,6 +118,9 @@ def _slug_extra_para_banco(n: str) -> str | None:
         return "descricao_modelo"
     if n == "style_desc" or (n.startswith("style_desc") and "descricao" in n):
         return "descricao_modelo"
+    # Planilha: "Color" + "COR" → color_cor
+    if n in {"color", "color_cor", "cor"} or n.startswith("color_"):
+        return "color"
     # Planilha: "Discount" + "COD DESCONTO" (duas linhas) → discountcod_desconto (já coberto o caso exato acima).
     if "cod_desconto" in n:
         return "cod_desconto"

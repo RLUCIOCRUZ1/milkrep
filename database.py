@@ -27,6 +27,7 @@ COLUNAS_PEDIDO_EXTRAS_NO_SUPABASE: tuple[str, ...] = (
     "nome_fantasia",
     "cnpj",
     "preposto",
+    "color",
     # "payment_type_condicao_de_pagamento",
 )
 
